@@ -11,7 +11,7 @@ RAM=1024
 DISK=16
 CORES=2
 TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 DEPLOY_DIR="/root/docker/n8n"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."
@@ -34,7 +34,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
   sleep 5
 fi
 
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << SETUP
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -81,10 +82,12 @@ ENVEOF
   echo 'HINWEIS: $DEPLOY_DIR/.env angelegt — N8N_ENCRYPTION_KEY setzen!'
 fi
 
-cd '$DEPLOY_DIR'
+cd $DEPLOY_DIR
 docker compose pull --quiet 2>/dev/null || true
 docker compose up -d
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME): http://${LXC_IP}:5678"
 echo "  ⚠  .env in LXC: pct exec 104 -- nano /root/docker/n8n/.env"

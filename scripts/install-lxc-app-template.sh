@@ -18,7 +18,7 @@ RAM=512
 DISK=8
 CORES=1
 TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 
 echo "► LXC Template $TEMPLATE_ID ($HOSTNAME) erstellen..."
 
@@ -50,7 +50,8 @@ for i in $(seq 1 30); do
 done
 
 # Docker CE installieren
-pct exec "$TEMPLATE_ID" -- bash -c "
+cat > /tmp/lxc-${TEMPLATE_ID}-setup.sh << 'SETUP'
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -65,7 +66,9 @@ systemctl start docker
 # Smoke-Test
 docker run --rm hello-world >/dev/null 2>&1 && echo 'Docker OK'
 docker compose version
-"
+SETUP
+pct push "$TEMPLATE_ID" /tmp/lxc-${TEMPLATE_ID}-setup.sh /tmp/setup.sh
+pct exec "$TEMPLATE_ID" -- bash /tmp/setup.sh
 echo "  ✓ Docker CE installiert"
 
 # Template konvertieren

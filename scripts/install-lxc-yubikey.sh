@@ -15,7 +15,7 @@ RAM=256
 DISK=4
 CORES=1
 TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 REPO_URL="https://github.com/WaR10ck-2025/yubikey-auth-service.git"
 DEPLOY_DIR="/root/docker/yubikey"
 
@@ -63,7 +63,8 @@ EOF
   echo "  ✓ Udev-Regel für /dev/yubikey angelegt"
 fi
 
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << SETUP
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -80,7 +81,9 @@ else
 fi
 
 bash '$DEPLOY_DIR/scripts/server/install.sh'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME): http://${LXC_IP}:8110"
 echo ""

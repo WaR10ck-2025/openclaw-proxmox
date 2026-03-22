@@ -11,7 +11,7 @@ RAM=256
 DISK=4
 CORES=1
 TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."
 
@@ -40,7 +40,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
 fi
 
 # Nginx Proxy Manager installieren
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << 'SETUP'
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
@@ -78,6 +79,8 @@ cd /opt/nginx-proxy-manager
 docker compose pull --quiet 2>/dev/null || docker-compose pull --quiet 2>/dev/null || true
 docker compose up -d || docker-compose up -d
 echo 'Nginx Proxy Manager gestartet'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME): http://${LXC_IP}:81  (admin@example.com / changeme)"

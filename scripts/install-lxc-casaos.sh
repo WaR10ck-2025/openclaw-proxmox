@@ -15,7 +15,7 @@ RAM=512
 DISK=8
 CORES=1
 TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."
 
@@ -42,7 +42,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
 fi
 
 # CasaOS installieren
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << 'SETUP'
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -53,19 +54,24 @@ curl -fsSL https://get.casaos.io | bash || \
 curl -fsSL https://raw.githubusercontent.com/IceWhaleTech/CasaOS/main/get-casaos.sh | bash
 command -v casaos &>/dev/null || { echo "CasaOS-Installation fehlgeschlagen"; exit 1; }
 echo 'CasaOS installiert'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 # casaos-lxc-bridge installieren
 BRIDGE_SRC="/root/openclaw-proxmox/casaos-lxc-bridge"
 if [ -d "$BRIDGE_SRC" ]; then
-  pct exec "$LXC_ID" -- bash -c "
+  cat > /tmp/lxc-${LXC_ID}-bridge-setup.sh << 'SETUP'
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get install -y -qq git
 git clone https://github.com/WaR10ck-2025/openclaw-proxmox.git /opt/openclaw-proxmox 2>/dev/null || \
   (cd /opt/openclaw-proxmox && git pull)
 bash /opt/openclaw-proxmox/casaos-lxc-bridge/install.sh
-"
+SETUP
+  pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-bridge-setup.sh /tmp/bridge-setup.sh
+  pct exec "$LXC_ID" -- bash /tmp/bridge-setup.sh
   echo "  ✓ casaos-lxc-bridge installiert (http://${LXC_IP}:8200)"
 else
   echo "  ⚠  casaos-lxc-bridge Quellcode nicht gefunden — manuell installieren:"

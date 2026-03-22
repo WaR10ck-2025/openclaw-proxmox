@@ -15,7 +15,7 @@ RAM=2048
 DISK=32
 CORES=2
 TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 CASAOS_API="http://192.168.10.141/v2/apps"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."
@@ -45,7 +45,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
 fi
 
 # ── Docker CE installieren ───────────────────────────────────────────────
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-docker.sh << 'SETUP'
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
@@ -60,49 +61,55 @@ apt-get install -y -qq ca-certificates curl docker.io docker-compose-plugin
 systemctl enable docker
 systemctl start docker
 docker --version
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-docker.sh /tmp/docker.sh
+pct exec "$LXC_ID" -- bash /tmp/docker.sh
 echo "  ✓ Docker CE bereit"
 
 # ── Passwörter generieren (einmalig) ────────────────────────────────────
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-passwords.sh << 'SETUP'
+#!/bin/bash
 set -e
 ENV_FILE=/opt/nextcloud/.env
 mkdir -p /opt/nextcloud/{data,db}
 
-if [ -f \"\$ENV_FILE\" ]; then
+if [ -f "$ENV_FILE" ]; then
   echo '  .env bereits vorhanden — Passwörter unverändert'
   exit 0
 fi
 
-DB_ROOT_PASSWORD=\$(openssl rand -hex 16)
-DB_PASSWORD=\$(openssl rand -hex 16)
-ADMIN_PASSWORD=\$(openssl rand -hex 12)
+DB_ROOT_PASSWORD=$(openssl rand -hex 16)
+DB_PASSWORD=$(openssl rand -hex 16)
+ADMIN_PASSWORD=$(openssl rand -hex 12)
 
-cat > \"\$ENV_FILE\" << EOF
-DB_ROOT_PASSWORD=\${DB_ROOT_PASSWORD}
-DB_PASSWORD=\${DB_PASSWORD}
-ADMIN_PASSWORD=\${ADMIN_PASSWORD}
+cat > "$ENV_FILE" << EOF
+DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+DB_PASSWORD=${DB_PASSWORD}
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
 EOF
-chmod 600 \"\$ENV_FILE\"
+chmod 600 "$ENV_FILE"
 echo '  ✓ Passwörter generiert + in /opt/nextcloud/.env gespeichert'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-passwords.sh /tmp/passwords.sh
+pct exec "$LXC_ID" -- bash /tmp/passwords.sh
 
 # ── docker-compose.yml schreiben ────────────────────────────────────────
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-compose.sh << 'SETUP'
+#!/bin/bash
 cat > /opt/nextcloud/docker-compose.yml << 'COMPOSE_EOF'
 services:
   db:
     image: mariadb:11
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: \${DB_ROOT_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
       MYSQL_DATABASE: nextcloud
       MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: \${DB_PASSWORD}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - /opt/nextcloud/db:/var/lib/mysql
     healthcheck:
-      test: [\"CMD\", \"healthcheck.sh\", \"--connect\", \"--innodb_initialized\"]
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -111,7 +118,7 @@ services:
     image: nextcloud:29-apache
     restart: unless-stopped
     ports:
-      - \"80:80\"
+      - "80:80"
     depends_on:
       db:
         condition: service_healthy
@@ -119,9 +126,9 @@ services:
       MYSQL_HOST: db
       MYSQL_DATABASE: nextcloud
       MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: \${DB_PASSWORD}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
       NEXTCLOUD_ADMIN_USER: admin
-      NEXTCLOUD_ADMIN_PASSWORD: \${ADMIN_PASSWORD}
+      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       NEXTCLOUD_TRUSTED_DOMAINS: 192.168.10.109
       PHP_MEMORY_LIMIT: 512M
       PHP_UPLOAD_LIMIT: 10G
@@ -129,14 +136,19 @@ services:
       - /opt/nextcloud/data:/var/www/html
 COMPOSE_EOF
 echo '  ✓ docker-compose.yml geschrieben'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-compose.sh /tmp/compose.sh
+pct exec "$LXC_ID" -- bash /tmp/compose.sh
 
 # ── Nextcloud starten ────────────────────────────────────────────────────
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-start.sh << 'SETUP'
+#!/bin/bash
 cd /opt/nextcloud
 docker compose --env-file .env up -d
 echo '  ✓ Nextcloud + MariaDB gestartet'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-start.sh /tmp/start.sh
+pct exec "$LXC_ID" -- bash /tmp/start.sh
 echo "  ✓ Container laufen — warte auf Nextcloud (kann 2-3 Min dauern)..."
 
 # Warten bis HTTP-Response (max 180s)

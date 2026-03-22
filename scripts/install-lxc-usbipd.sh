@@ -16,7 +16,7 @@ RAM=128
 DISK=2
 CORES=1
 TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."
 
@@ -54,7 +54,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
 fi
 
 # usbipd installieren und als systemd-Service einrichten
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << 'SETUP'
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -79,7 +80,7 @@ Type=forking
 ExecStartPre=/sbin/modprobe usbip_core
 ExecStartPre=/sbin/modprobe usbip_host
 ExecStart=/usr/sbin/usbipd --daemon
-ExecStartPost=/bin/bash -c \"sleep 1 && BUSID=\$(usbip list -l 2>/dev/null | grep '0403:d6da' | awk '{print \$1}' | tr -d ':') && [ -n \\\"\$BUSID\\\" ] && usbip bind --busid=\\\"\$BUSID\\\" || echo 'Autocom CDP+ nicht gefunden'\"
+ExecStartPost=/bin/bash -c "sleep 1 && BUSID=$(usbip list -l 2>/dev/null | grep '0403:d6da' | awk '{print $1}' | tr -d ':') && [ -n \"$BUSID\" ] && usbip bind --busid=\"$BUSID\" || echo 'Autocom CDP+ nicht gefunden'"
 Restart=on-failure
 RestartSec=10s
 
@@ -90,7 +91,9 @@ SERVICEEOF
 systemctl daemon-reload
 systemctl enable usbipd
 systemctl start usbipd 2>/dev/null || echo 'usbipd start fehlgeschlagen (USB-Gerät nicht angeschlossen?)'
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME): usbipd auf ${LXC_IP}:3240"
 echo ""

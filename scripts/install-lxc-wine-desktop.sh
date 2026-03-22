@@ -16,7 +16,7 @@ RAM=2048
 DISK=16
 CORES=2
 TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 REPO_URL="https://github.com/WaR10ck-2025/wine-docker-manager.git"
 DEPLOY_DIR="/root/docker/wine-manager"
 
@@ -52,7 +52,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
   sleep 8
 fi
 
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << SETUP
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -67,7 +68,7 @@ else
   git clone '$REPO_URL' '$DEPLOY_DIR' --quiet
 fi
 
-cd '$DEPLOY_DIR'
+cd $DEPLOY_DIR
 
 # Nur wine-desktop Service starten (kein api, kein ui — laufen in eigenen LXCs)
 # Proxmox Override: usbip-server + windows-vm deaktiviert
@@ -75,7 +76,9 @@ docker compose \
   -f docker-compose.yml \
   -f /opt/openclaw-proxmox/docker-compose.proxmox.yml \
   up -d wine-desktop
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME):"
 echo "     VNC (direkt):  ${LXC_IP}:5900"

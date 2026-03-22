@@ -11,7 +11,7 @@ RAM=256
 DISK=4
 CORES=1
 TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
-STORAGE="local-lvm"
+STORAGE="${STORAGE:-local-lvm}"
 REPO_URL="https://github.com/WaR10ck-2025/wine-docker-manager.git"
 DEPLOY_DIR="/root/docker/wine-manager"
 
@@ -35,7 +35,8 @@ if ! pct status "$LXC_ID" | grep -q "running"; then
   sleep 5
 fi
 
-pct exec "$LXC_ID" -- bash -c "
+cat > /tmp/lxc-${LXC_ID}-setup.sh << SETUP
+#!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -50,7 +51,7 @@ else
   git clone '$REPO_URL' '$DEPLOY_DIR' --quiet
 fi
 
-cd '$DEPLOY_DIR'
+cd $DEPLOY_DIR
 
 # Nginx-Proxy-Config für API-Backend in LXC 201
 # Das Frontend-Image proxied /api → manager-api (192.168.10.201:4000)
@@ -60,7 +61,7 @@ services:
   manager-ui:
     environment:
       # Nginx in wine-ui muss /api → 192.168.10.201:4000 proxyen
-      API_HOST: \"http://192.168.10.201:4000\"
+      API_HOST: "http://192.168.10.201:4000"
 EOF
 
 docker compose \
@@ -68,7 +69,9 @@ docker compose \
   -f /opt/openclaw-proxmox/docker-compose.proxmox.yml \
   -f /root/wine-ui-compose-override.yml \
   up -d manager-ui
-"
+SETUP
+pct push "$LXC_ID" /tmp/lxc-${LXC_ID}-setup.sh /tmp/setup.sh
+pct exec "$LXC_ID" -- bash /tmp/setup.sh
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME): http://${LXC_IP}:3000"
 echo ""
