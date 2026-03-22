@@ -40,10 +40,10 @@ pct exec "$LXC_ID" -- bash -c "
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-# Docker Socket-Zugriff: Deployment Hub braucht den Docker-Socket des HOST (via Proxmox API)
-# Hier: Docker wird im LXC installiert, der Hub deployt per Proxmox API in andere LXCs
-apt-get install -y -qq docker.io docker-compose-plugin git curl
+apt-get install -y -qq curl ca-certificates git
 
+# Docker CE via get.docker.com (inkl. compose plugin)
+curl -fsSL https://get.docker.com | sh -s -- --quiet 2>/dev/null
 systemctl enable docker --quiet
 systemctl start docker
 
