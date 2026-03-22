@@ -19,7 +19,7 @@ DONE_FLAG="/etc/openclaw-setup.done"
 REPO_URL="https://github.com/WaR10ck-2025/openclaw-proxmox.git"
 REPO_DIR="/opt/openclaw-proxmox"
 SCRIPTS="$REPO_DIR/scripts"
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE="debian-12-standard_12.12-1_amd64.tar.zst"
 
 # Logging-Helper
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
@@ -38,13 +38,32 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# ── Schritt 2: Basis-Pakete ───────────────────────────────────────────────
+# ── Schritt 2: Proxmox Repos fixen (Enterprise → No-Subscription) ─────────
+log_section "APT Repos konfigurieren"
+# Enterprise-Repos deaktivieren (kein Abo → 401 Fehler bei apt-get update)
+for f in /etc/apt/sources.list.d/pve-enterprise.sources \
+          /etc/apt/sources.list.d/ceph.sources; do
+  if [ -f "$f" ] && ! grep -q "^Enabled: no" "$f"; then
+    echo "Enabled: no" >> "$f"
+    log "  Deaktiviert: $f"
+  fi
+done
+
+# No-Subscription Repo hinzufügen falls nicht vorhanden
+if [ ! -f /etc/apt/sources.list.d/pve-no-subscription.list ]; then
+  echo "deb http://download.proxmox.com/debian/pve trixie pve-no-subscription" \
+    > /etc/apt/sources.list.d/pve-no-subscription.list
+  log "  No-Subscription Repo hinzugefügt"
+fi
+log "✓ APT Repos konfiguriert"
+
+# ── Schritt 3: Basis-Pakete ───────────────────────────────────────────────
 log_section "Basis-Pakete installieren"
 apt-get update -qq
 apt-get install -y -qq git curl
 
-# ── Schritt 3: Repo klonen ────────────────────────────────────────────────
-log_section "wine-docker-manager Repo klonen"
+# ── Schritt 4: Repo klonen ────────────────────────────────────────────────
+log_section "openclaw-proxmox Repo klonen"
 if [ -d "$REPO_DIR/.git" ]; then
   log "Repo bereits vorhanden — aktualisiere..."
   cd "$REPO_DIR" && git pull --quiet
@@ -64,13 +83,13 @@ else
 fi
 
 # ── Schritt 5: Basis-LXCs anlegen ─────────────────────────────────────────
-log_section "LXC 10: Nginx Proxy Manager"
+log_section "LXC 110: Nginx Proxy Manager"
 bash "$SCRIPTS/install-lxc-reverse-proxy.sh" 2>&1 | tee -a "$LOG_FILE"
 
-log_section "LXC 20: CasaOS Dashboard"
+log_section "LXC 120: CasaOS Dashboard"
 bash "$SCRIPTS/install-lxc-casaos.sh" 2>&1 | tee -a "$LOG_FILE"
 
-log_section "LXC 107: GitHub Deployment Hub"
+log_section "LXC 170: GitHub Deployment Hub"
 bash "$SCRIPTS/install-lxc-deployment-hub.sh" 2>&1 | tee -a "$LOG_FILE"
 
 # ── Schritt 6: ZFS-Unlock Service aktivieren (falls noch nicht) ───────────
@@ -98,14 +117,29 @@ if command -v systemd-cryptenroll &>/dev/null; then
   fi
 fi
 
-# ── Schritt 8: Status-Ausgabe ─────────────────────────────────────────────
+# ── Schritt 8: Verschlüsselte ZFS Datendisks prüfen ──────────────────────
+log_section "Datendisks prüfen (LUKS/ZFS)"
+# Alle Disks auflisten die NICHT die System-Disk sind
+SYS_DISK=$(lsblk -no pkname $(findmnt -n -o SOURCE /) 2>/dev/null | head -1 || echo "sda")
+EXTRA_DISKS=$(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}' | grep -v "^$SYS_DISK$" || true)
+
+if [ -n "$EXTRA_DISKS" ]; then
+  log "Zusätzliche Disks gefunden: $EXTRA_DISKS"
+  log "  → Verschlüsselten ZFS Pool anlegen:"
+  log "     bash $REPO_DIR/autoinstall/zfs-pool-create.sh"
+else
+  log "Info: Keine zusätzlichen Datendisks — ZFS Pool kann später hinzugefügt werden"
+  log "      bash $REPO_DIR/autoinstall/zfs-pool-create.sh"
+fi
+
+# ── Schritt 9: Status-Ausgabe ─────────────────────────────────────────────
 log_section "Setup abgeschlossen"
 PROXMOX_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127 | head -1)
 
-log "✓ LXC 10 (Nginx Proxy Manager): http://192.168.10.140:81"
+log "✓ LXC 110 (Nginx Proxy Manager): http://192.168.10.140:81"
 log "  Login: admin@example.com / changeme  ← SOFORT ÄNDERN!"
-log "✓ LXC 20 (CasaOS Dashboard):    http://192.168.10.141"
-log "✓ LXC 107 (Deployment Hub):     http://192.168.10.107:8100"
+log "✓ LXC 120 (CasaOS Dashboard):    http://192.168.10.141"
+log "✓ LXC 170 (Deployment Hub):     http://192.168.10.170:8100"
 log ""
 log "Proxmox Web-UI: https://${PROXMOX_IP}:8006"
 log "SSH:            ssh root@${PROXMOX_IP}"

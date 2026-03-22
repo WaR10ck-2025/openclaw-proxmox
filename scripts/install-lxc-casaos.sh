@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-lxc-casaos.sh — LXC 20: CasaOS Dashboard
+# install-lxc-casaos.sh — LXC 120: CasaOS Dashboard
 # IP: 192.168.10.141 | Port: :80
 #
 # CasaOS läuft hier NUR als Dashboard/App-Store-UI.
@@ -8,13 +8,13 @@
 
 set -e
 
-LXC_ID=20
+LXC_ID=120
 LXC_IP="192.168.10.141"
 HOSTNAME="casaos-dashboard"
 RAM=512
 DISK=8
 CORES=1
-TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
 STORAGE="local-lvm"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."

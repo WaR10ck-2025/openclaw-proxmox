@@ -139,67 +139,91 @@ if $USE_PVE_ASSISTANT; then
 
 # ── Modus B: Manueller ISO-Bau mit squashfs-Modifikation ─────────────────
 else
-  echo "  Extrahiere ISO..."
-  7z x -o"$WORK_DIR/iso-extract" "$PVE_ISO" -y -bsp0 -bso0 2>/dev/null || \
-  xorriso -osirrox on -indev "$PVE_ISO" -extract / "$WORK_DIR/iso-extract"
+  echo "  Extrahiere ISO-Inhalte..."
+  xorriso -osirrox on -indev "$PVE_ISO" -extract / "$WORK_DIR/iso-extract" 2>/dev/null || \
+  7z x -o"$WORK_DIR/iso-extract" "$PVE_ISO" -y -bsp0 -bso0 2>/dev/null
 
-  # squashfs Installer-Dateisystem extrahieren
-  SQUASH_FILE=$(find "$WORK_DIR/iso-extract" -name "*.squashfs" | head -1)
-  if [ -z "$SQUASH_FILE" ]; then
-    echo "✗ squashfs nicht gefunden — ISO-Format unbekannt"
+  # ISO-Inhalte prüfen
+  if [ ! -d "$WORK_DIR/iso-extract" ] || [ -z "$(ls -A "$WORK_DIR/iso-extract" 2>/dev/null)" ]; then
+    echo "✗ ISO-Extraktion fehlgeschlagen"
     exit 1
   fi
+  echo "  ISO-Inhalte:"
+  ls "$WORK_DIR/iso-extract/"
 
-  echo "  squashfs extrahieren: $SQUASH_FILE"
-  unsquashfs -d "$WORK_DIR/squashfs-extract" "$SQUASH_FILE" 2>/dev/null
+  # answer.toml ins ISO-Root legen (Proxmox liest es beim Booten von dort)
+  echo "  answer.toml → ISO-Root..."
+  cp "$SCRIPT_DIR/answer.toml" "$WORK_DIR/iso-extract/answer.toml"
 
-  # ── First-boot Scripts in installiertes System injizieren ─────────────
-  TARGET="$WORK_DIR/squashfs-extract"
-  echo "  First-boot Scripts injizieren..."
+  # squashfs Installer-Dateisystem extrahieren (für first-boot Injection)
+  SQUASH_FILE=$(find "$WORK_DIR/iso-extract" -name "*.squashfs" -o -name "pve-base.squashfs" 2>/dev/null | head -1)
 
-  # Scripts nach /root/ (wird auf die installierte Disk kopiert)
-  install -m 755 "$SCRIPT_DIR/first-boot.sh" "$TARGET/root/openclaw-first-boot.sh"
-  install -m 644 "$SCRIPT_DIR/first-boot.service" "$TARGET/etc/systemd/system/openclaw-first-boot.service"
-  install -m 755 "$SCRIPT_DIR/yubikey-enroll.sh" "$TARGET/root/" 2>/dev/null || true
-  install -m 755 "$SCRIPT_DIR/zfs-unlock.sh" "$TARGET/usr/local/bin/" 2>/dev/null || true
-  install -m 644 "$SCRIPT_DIR/zfs-unlock.service" "$TARGET/etc/systemd/system/" 2>/dev/null || true
-  install -m 755 "$SCRIPT_DIR/zfs-pool-create.sh" "$TARGET/root/" 2>/dev/null || true
+  if [ -z "$SQUASH_FILE" ]; then
+    echo "  ℹ  squashfs nicht gefunden — first-boot Scripts werden via Git geklont"
+    echo "     (answer.toml Autoinstall funktioniert trotzdem)"
+  else
+    echo "  squashfs gefunden: $SQUASH_FILE"
+    echo "  squashfs extrahieren (kann 2–5 Min dauern)..."
 
-  # answer.toml für Proxmox Installer (wird vom ISO-Installer gelesen)
-  install -m 644 "$SCRIPT_DIR/answer.toml" "$TARGET/etc/proxmox-installer/answer.toml" 2>/dev/null || \
-  install -m 644 "$SCRIPT_DIR/answer.toml" "$WORK_DIR/iso-extract/answer.toml"
+    # Extraktion mit vollem Output für Debugging
+    if ! unsquashfs -d "$WORK_DIR/squashfs-extract" "$SQUASH_FILE"; then
+      echo "  ✗ unsquashfs fehlgeschlagen — überspringe first-boot Injection"
+      echo "  ℹ  Autoinstall via answer.toml funktioniert weiterhin"
+      SQUASH_FILE=""
+    fi
+  fi
 
-  # systemd service enablen (Symlink)
-  ln -sf /etc/systemd/system/openclaw-first-boot.service \
-    "$TARGET/etc/systemd/system/multi-user.target.wants/openclaw-first-boot.service" 2>/dev/null || true
+  if [ -n "$SQUASH_FILE" ] && [ -d "$WORK_DIR/squashfs-extract" ]; then
+    TARGET="$WORK_DIR/squashfs-extract"
+    echo "  squashfs-Inhalt:"
+    ls "$TARGET/" | head -20
 
-  # squashfs neu packen
-  echo "  squashfs neu packen..."
-  rm "$SQUASH_FILE"
-  mksquashfs "$WORK_DIR/squashfs-extract" "$SQUASH_FILE" -comp gzip -noappend -quiet
+    # Ziel-Verzeichnisse sicherstellen
+    mkdir -p "$TARGET/root"
+    mkdir -p "$TARGET/etc/systemd/system/multi-user.target.wants"
+    mkdir -p "$TARGET/usr/local/bin"
+    mkdir -p "$TARGET/etc/proxmox-installer"
 
-  # ISO neu erstellen
+    echo "  First-boot Scripts injizieren..."
+    install -m 755 "$SCRIPT_DIR/first-boot.sh"      "$TARGET/root/openclaw-first-boot.sh"
+    install -m 644 "$SCRIPT_DIR/first-boot.service" "$TARGET/etc/systemd/system/openclaw-first-boot.service"
+    install -m 755 "$SCRIPT_DIR/yubikey-enroll.sh"  "$TARGET/root/" 2>/dev/null || true
+    install -m 755 "$SCRIPT_DIR/zfs-unlock.sh"      "$TARGET/usr/local/bin/" 2>/dev/null || true
+    install -m 644 "$SCRIPT_DIR/zfs-unlock.service" "$TARGET/etc/systemd/system/" 2>/dev/null || true
+    install -m 755 "$SCRIPT_DIR/zfs-pool-create.sh" "$TARGET/root/" 2>/dev/null || true
+
+    # systemd service enablen (Symlink)
+    ln -sf /etc/systemd/system/openclaw-first-boot.service \
+      "$TARGET/etc/systemd/system/multi-user.target.wants/openclaw-first-boot.service" 2>/dev/null || true
+
+    # squashfs neu packen
+    echo "  squashfs neu packen (kann 5–10 Min dauern)..."
+    rm "$SQUASH_FILE"
+    mksquashfs "$WORK_DIR/squashfs-extract" "$SQUASH_FILE" -comp xz -noappend -quiet
+    echo "  ✓ squashfs aktualisiert"
+  fi
+
+  # ── ISO neu erstellen mit original Boot-Parametern ─────────────────────
   echo "  ISO neu bauen..."
-  VOLID="ProxmoxVE"
+
+  # Boot-Konfiguration aus Original-ISO auslesen
+  MBR_IMG=$(find "$WORK_DIR/iso-extract" -name "boot_hybrid.img" -o -name "isohdpfx.bin" 2>/dev/null | head -1)
+  EFI_IMG=$(find "$WORK_DIR/iso-extract" -path "*/grub/efi.img" -o -path "*/efi.img" 2>/dev/null | head -1)
+  ELTORITO=$(find "$WORK_DIR/iso-extract" -path "*/grub/i386-pc/eltorito.img" 2>/dev/null | head -1)
+
+  # EFI-Image relativer Pfad
+  EFI_REL="${EFI_IMG#$WORK_DIR/iso-extract/}"
+  ELTORITO_REL="${ELTORITO#$WORK_DIR/iso-extract/}"
+
   xorriso -as mkisofs \
-    -V "$VOLID" \
-    -J -joliet-long \
-    -r \
-    -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin 2>/dev/null || true \
+    -V "ProxmoxVE" \
+    -J -joliet-long -r \
+    ${MBR_IMG:+--grub2-mbr "$MBR_IMG"} \
     -partition_offset 16 \
-    -c boot/boot.cat \
-    -b boot/grub/i386-pc/eltorito.img \
-    -no-emul-boot \
-    -boot-load-size 4 \
-    -boot-info-table \
-    --grub2-boot-info \
-    --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img 2>/dev/null \
-    -eltorito-alt-boot \
-    -e boot/grub/efi.img \
-    -no-emul-boot \
-    -isohybrid-gpt-basdat \
+    ${ELTORITO_REL:+-b "$ELTORITO_REL" -no-emul-boot -boot-load-size 4 -boot-info-table --grub2-boot-info} \
+    ${EFI_REL:+-eltorito-alt-boot -e "$EFI_REL" -no-emul-boot -isohybrid-gpt-basdat} \
     -o "$OUTPUT_ISO" \
-    "$WORK_DIR/iso-extract" 2>/dev/null
+    "$WORK_DIR/iso-extract" 2>&1 | tail -5
 
   echo "  ✓ Manueller ISO-Bau abgeschlossen"
 fi

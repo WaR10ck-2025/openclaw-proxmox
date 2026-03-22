@@ -1,16 +1,15 @@
 # answer.toml — Proxmox VE 8.1+ Autoinstall Konfiguration
 #
-# Verwendung:
-#   Option A (empfohlen): build-iso.sh baut answer.toml in die ISO ein
-#   Option B (manuell):   answer.toml auf separaten USB-Stick (zweites Laufwerk),
-#                         Proxmox erkennt es automatisch beim Boot
-#
 # Dokumentation: https://pve.proxmox.com/wiki/Automated_Installation
 #
-# WICHTIG: Vor Verwendung anpassen:
+# WICHTIG: Vor Deployment anpassen:
 #   - root_password → sicheres Passwort setzen
-#   - disk_password → LUKS-Passphrase setzen (NICHT gleich wie root_password!)
 #   - fqdn          → Hostname anpassen
+#   - disk_list     → Disk für echte Hardware (z.B. /dev/nvme0n1)
+#
+# LUKS-Verschlüsselung: Nicht in answer.toml unterstützt (PVE 8.4+)
+#   → Wird via first-boot.sh für Datendisks (ZFS) eingerichtet
+#   → Für System-Disk: manuell mit graphischem Installer (Advanced Options)
 
 [global]
 keyboard = "de"
@@ -18,10 +17,8 @@ country = "de"
 fqdn = "openclaw.local"
 mailto = "Elias.Boos.000@gmail.com"
 timezone = "Europe/Berlin"
-
-# Root-Passwort für SSH + Proxmox Web-UI Login
-# ÄNDERN vor Deployment!
 root_password = "openclaw2024!"
+reboot_on_error = false
 
 # Optional: SSH Public Key für passwortlosen Login
 # root_ssh_keys = ["ssh-ed25519 AAAA... user@host"]
@@ -38,18 +35,10 @@ source = "from-dhcp"
 # dns = "192.168.10.1"
 
 [disk-setup]
-# Dateisystem für Proxmox Root + PVE Storage (LXC/VM Disks)
 filesystem = "ext4"
+# VM-Test: /dev/sda | Echte Hardware: /dev/nvme0n1 oder /dev/sda
+disk_list = ["/dev/sda"]
 
-# Disk-Liste leer = erste verfügbare Disk automatisch wählen
-# Explizit setzen: disk_list = ["/dev/sda"]
-disk_list = []
-
-# LUKS2 Verschlüsselung der System-Disk
-# Die gesamte PVE Storage wird verschlüsselt (root + lxc/vm disks)
-# Passphrase kann später durch YubiKey FIDO2 ergänzt werden (yubikey-enroll.sh)
-# ÄNDERN vor Deployment!
-disk_password = "openclaw-luks-2024!"
-
-# Gesamte Disk nutzen (0 = auto)
-# lvm_auto_align = true
+[first-boot]
+source = "from-iso"
+ordering = "network-online"

@@ -1,17 +1,17 @@
 #!/bin/bash
-# install-lxc-deployment-hub.sh — LXC 107: GitHub Deployment Hub
-# IP: 192.168.10.107 | Port: :8100
+# install-lxc-deployment-hub.sh — LXC 170: GitHub Deployment Hub
+# IP: 192.168.10.170 | Port: :8100
 # Repo: https://github.com/WaR10ck-2025/GitHub-Deployment-Connector
 
 set -e
 
-LXC_ID=107
-LXC_IP="192.168.10.107"
+LXC_ID=170
+LXC_IP="192.168.10.170"
 HOSTNAME="deployment-hub"
 RAM=512
 DISK=8
 CORES=1
-TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
 STORAGE="local-lvm"
 REPO_URL="https://github.com/WaR10ck-2025/GitHub-Deployment-Connector.git"
 DEPLOY_DIR="/root/docker/deployment-hub"
@@ -74,4 +74,4 @@ bash '$DEPLOY_DIR/scripts/server/install.sh'
 "
 
 echo "  ✓ LXC $LXC_ID ($HOSTNAME): http://${LXC_IP}:8100"
-echo "  ⚠  Proxmox API-Token in .env setzen: pct exec 107 -- nano $DEPLOY_DIR/.env"
+echo "  ⚠  Proxmox API-Token in .env setzen: pct exec 170 -- nano $DEPLOY_DIR/.env"

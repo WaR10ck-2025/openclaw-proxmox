@@ -1,16 +1,16 @@
 #!/bin/bash
-# install-lxc-reverse-proxy.sh — LXC 10: Nginx Proxy Manager
+# install-lxc-reverse-proxy.sh — LXC 110: Nginx Proxy Manager
 # IP: 192.168.10.140 | Ports: :80 :443 :81 (Admin-UI)
 
 set -e
 
-LXC_ID=10
+LXC_ID=110
 LXC_IP="192.168.10.140"
 HOSTNAME="reverse-proxy"
 RAM=256
 DISK=4
 CORES=1
-TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
 STORAGE="local-lvm"
 
 echo "► LXC $LXC_ID ($HOSTNAME) — $LXC_IP..."
