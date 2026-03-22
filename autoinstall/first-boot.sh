@@ -38,6 +38,21 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+# ── Schritt 1b: NAT/Masquerade für LXC-Netzwerk aktivieren ──────────────────
+# Stellt sicher dass LXCs Internet-Zugang haben, auch wenn der upstream Router
+# das 192.168.10.x Subnetz nicht kennt (z.B. VirtualBox NAT, einfache Router).
+log "Aktiviere IP-Masquerade für LXC-Netzwerk..."
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+# Persistenz über Neustarts
+grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || \
+  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+# Masquerade nur hinzufügen wenn nicht schon vorhanden
+iptables -t nat -C POSTROUTING -s 192.168.10.0/24 -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -s 192.168.10.0/24 -j MASQUERADE
+# Regel für Neustarts speichern
+command -v iptables-save &>/dev/null && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+log "✓ IP-Masquerade aktiv"
+
 # ── Schritt 2: Proxmox Repos fixen (Enterprise → No-Subscription) ─────────
 log_section "APT Repos konfigurieren"
 # Enterprise-Repos deaktivieren (kein Abo → 401 Fehler bei apt-get update)
