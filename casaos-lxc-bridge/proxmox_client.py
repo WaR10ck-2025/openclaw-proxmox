@@ -132,15 +132,25 @@ class ProxmoxClient:
 
     def exec_in_lxc(self, lxc_id: int, command: str) -> None:
         """Führt Shell-Befehl im LXC aus — via SSH zum Proxmox-Host + pct exec."""
-        import subprocess, re
+        import subprocess, re, tempfile, shutil, stat, os
         host_ip = re.sub(r"https?://([^:/]+).*", r"\1", PROXMOX_HOST)
-        ssh_cmd = [
-            "ssh", "-i", PROXMOX_SSH_KEY,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
-            f"root@{host_ip}",
-            f"pct exec {lxc_id} -- bash -c {repr(command)}",
-        ]
-        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=300)
+        # Tempfile mit 0600 — Docker-Volume-Mount übernimmt Berechtigungen nicht immer korrekt
+        tmp_key = tempfile.mktemp(suffix=".key")
+        try:
+            shutil.copy2(PROXMOX_SSH_KEY, tmp_key)
+            os.chmod(tmp_key, stat.S_IRUSR | stat.S_IWUSR)
+            ssh_cmd = [
+                "ssh", "-i", tmp_key,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=10",
+                f"root@{host_ip}",
+                f"pct exec {lxc_id} -- bash -c {repr(command)}",
+            ]
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=300)
+        finally:
+            try:
+                os.unlink(tmp_key)
+            except OSError:
+                pass
         if result.returncode != 0:
             raise RuntimeError(f"pct exec failed (SSH): {result.stderr}")
