@@ -86,6 +86,8 @@ def register(meta: AppMeta, rec: AppRecord) -> str:
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         raise RuntimeError(f"CasaOS Registration fehlgeschlagen: HTTP {e.code} — {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"CasaOS nicht erreichbar: {e.reason}") from e
 
 
 def unregister(app_id: str) -> str:
