@@ -45,9 +45,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates
 
-# CasaOS offizieller Installer
-curl -fsSL https://get.casaos.io | bash 2>/dev/null || \
+# CasaOS offizieller Installer (Fallback auf GitHub-URL)
+curl -fsSL https://get.casaos.io | bash || \
 curl -fsSL https://raw.githubusercontent.com/IceWhaleTech/CasaOS/main/get-casaos.sh | bash
+command -v casaos &>/dev/null || { echo "CasaOS-Installation fehlgeschlagen"; exit 1; }
 echo 'CasaOS installiert'
 "
 

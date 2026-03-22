@@ -46,8 +46,9 @@ apt-get update -qq
 apt-get install -y -qq curl ca-certificates gnupg2 lsb-release
 
 # Docker installieren
-curl -fsSL https://get.docker.com | sh -s -- --quiet 2>/dev/null
+curl -fsSL https://get.docker.com | sh -s -- --quiet
 systemctl enable docker --quiet
+command -v docker &>/dev/null || { echo "Docker-Installation fehlgeschlagen"; exit 1; }
 
 # Nginx Proxy Manager deployen
 mkdir -p /opt/nginx-proxy-manager

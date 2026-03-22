@@ -82,15 +82,24 @@ else
   log "✓ Template bereits vorhanden"
 fi
 
-# ── Schritt 5: Basis-LXCs anlegen ─────────────────────────────────────────
-log_section "LXC 110: Nginx Proxy Manager"
-bash "$SCRIPTS/install-lxc-reverse-proxy.sh" 2>&1 | tee -a "$LOG_FILE"
+# ── Schritt 5: Basis-LXCs anlegen (parallel) ──────────────────────────────
+log_section "LXC 110 + 120 + 170: Parallel-Installation"
+log "Starte alle drei LXCs gleichzeitig..."
 
-log_section "LXC 120: CasaOS Dashboard"
-bash "$SCRIPTS/install-lxc-casaos.sh" 2>&1 | tee -a "$LOG_FILE"
+bash "$SCRIPTS/install-lxc-reverse-proxy.sh"   > /tmp/lxc-110.log 2>&1 & PID_110=$!
+bash "$SCRIPTS/install-lxc-casaos.sh"           > /tmp/lxc-120.log 2>&1 & PID_120=$!
+bash "$SCRIPTS/install-lxc-deployment-hub.sh"   > /tmp/lxc-170.log 2>&1 & PID_170=$!
 
-log_section "LXC 170: GitHub Deployment Hub"
-bash "$SCRIPTS/install-lxc-deployment-hub.sh" 2>&1 | tee -a "$LOG_FILE"
+INSTALL_FAIL=0
+wait $PID_110 || { log "✗ LXC 110 fehlgeschlagen (Exit: $?)"; INSTALL_FAIL=1; }
+wait $PID_120 || { log "✗ LXC 120 fehlgeschlagen (Exit: $?)"; INSTALL_FAIL=1; }
+wait $PID_170 || { log "✗ LXC 170 fehlgeschlagen (Exit: $?)"; INSTALL_FAIL=1; }
+
+cat /tmp/lxc-110.log >> "$LOG_FILE"
+cat /tmp/lxc-120.log >> "$LOG_FILE"
+cat /tmp/lxc-170.log >> "$LOG_FILE"
+
+[ "$INSTALL_FAIL" -eq 0 ] || { log "✗ LXC-Installation fehlgeschlagen — Setup abgebrochen"; exit 1; }
 
 # ── Schritt 6: ZFS-Unlock Service aktivieren (falls noch nicht) ───────────
 if [ -f "$REPO_DIR/autoinstall/zfs-unlock.service" ]; then

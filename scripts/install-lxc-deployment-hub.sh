@@ -47,15 +47,16 @@ apt-get update -qq
 apt-get install -y -qq curl ca-certificates git openssh-client
 
 # Docker CE via get.docker.com (inkl. compose plugin)
-curl -fsSL https://get.docker.com | sh -s -- --quiet 2>/dev/null
+curl -fsSL https://get.docker.com | sh -s -- --quiet
 systemctl enable docker --quiet
 systemctl start docker
+command -v docker &>/dev/null || { echo "Docker-Installation fehlgeschlagen"; exit 1; }
 
-# Deploy Key einrichten (SSH-Authentifizierung für privates Repo)
+# Deploy Key einrichten (SSH für privates Repo, idempotent)
 mkdir -p /root/.ssh && chmod 700 /root/.ssh
 echo '${DEPLOY_KEY_B64}' | base64 -d > /root/.ssh/openclaw-deploy-key
 chmod 600 /root/.ssh/openclaw-deploy-key
-cat >> /root/.ssh/config << 'SSHCONF'
+grep -q 'openclaw-deploy-key' /root/.ssh/config 2>/dev/null || cat >> /root/.ssh/config << 'SSHCONF'
 Host github.com
   IdentityFile /root/.ssh/openclaw-deploy-key
   StrictHostKeyChecking no
