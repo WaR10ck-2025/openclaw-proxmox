@@ -12,6 +12,7 @@ import ssl
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass
 
 PROXMOX_HOST = os.getenv("PROXMOX_HOST", "https://192.168.10.147:8006")
@@ -84,14 +85,32 @@ class ProxmoxClient:
                 return f"192.168.10.{LXC_IP_START + offset}"
         raise RuntimeError("Keine freie IP im App-Bereich")
 
+    def _wait_for_task(self, upid: str, timeout: int = 120) -> None:
+        """Wartet bis ein Proxmox-Task (UPID) abgeschlossen ist."""
+        import time
+        for _ in range(timeout):
+            result = self._request("GET", f"/nodes/{PROXMOX_NODE}/tasks/{urllib.parse.quote(upid, safe='')}/status")
+            status = result.get("data", {}).get("status", "")
+            if status == "stopped":
+                exitstatus = result.get("data", {}).get("exitstatus", "")
+                if exitstatus != "OK":
+                    raise RuntimeError(f"Proxmox Task fehlgeschlagen: {exitstatus}")
+                return
+            time.sleep(1)
+        raise TimeoutError(f"Proxmox Task {upid} nicht abgeschlossen nach {timeout}s")
+
     def clone_template(self, new_id: int, hostname: str, ip: str) -> None:
         """Klont das App-Template (ID 9000) zu einem neuen LXC."""
-        self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{TEMPLATE_ID}/clone", {
+        result = self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{TEMPLATE_ID}/clone", {
             "newid": new_id,
             "hostname": hostname,
             "full": 1,
             "storage": LXC_STORAGE,
         })
+        # Warten bis Clone-Task abgeschlossen (Lock freigegeben)
+        upid = result.get("data", "")
+        if upid:
+            self._wait_for_task(upid)
         # Netzwerk setzen
         self._request("PUT", f"/nodes/{PROXMOX_NODE}/lxc/{new_id}/config", {
             "net0": f"name=eth0,bridge=vmbr0,ip={ip}/24,gw={LXC_GATEWAY}",
