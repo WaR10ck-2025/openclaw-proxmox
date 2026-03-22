@@ -68,8 +68,8 @@ cat > /tmp/lxc-${LXC_ID}-setup.sh << SETUP
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq docker.io docker-compose-plugin git curl \
-  libhidapi-dev libfido2-dev usbutils
+apt-get install -y -qq git curl libhidapi-dev libfido2-dev usbutils
+curl -fsSL https://get.docker.com | sh
 
 systemctl enable docker --quiet
 systemctl start docker

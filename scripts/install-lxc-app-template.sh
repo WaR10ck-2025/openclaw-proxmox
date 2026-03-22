@@ -49,15 +49,16 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# Docker CE installieren
+# Docker CE installieren (offizielles Docker-Repo via get.docker.com)
 cat > /tmp/lxc-${TEMPLATE_ID}-setup.sh << 'SETUP'
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq \
-  ca-certificates curl gnupg lsb-release \
-  docker.io docker-compose-plugin
+apt-get install -y -qq ca-certificates curl
+
+# Docker offiziell installieren (inkl. docker-compose-plugin)
+curl -fsSL https://get.docker.com | sh
 
 # Docker-Dienst aktivieren
 systemctl enable docker

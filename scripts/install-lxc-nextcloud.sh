@@ -57,7 +57,8 @@ if command -v docker &>/dev/null; then
 fi
 
 apt-get update -qq
-apt-get install -y -qq ca-certificates curl docker.io docker-compose-plugin
+apt-get install -y -qq ca-certificates curl
+curl -fsSL https://get.docker.com | sh
 systemctl enable docker
 systemctl start docker
 docker --version

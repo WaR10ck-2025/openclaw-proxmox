@@ -39,7 +39,8 @@ cat > /tmp/lxc-${LXC_ID}-setup.sh << SETUP
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq docker.io docker-compose-plugin curl
+apt-get install -y -qq ca-certificates curl
+curl -fsSL https://get.docker.com | sh
 
 systemctl enable docker --quiet
 systemctl start docker
