@@ -103,6 +103,23 @@ else
   log "✓ Template bereits vorhanden"
 fi
 
+# ── Schritt 4c: Storage auto-detektieren (local-lvm oder local-zfs) ──────────
+LXC_STORAGE="local-lvm"
+if ! pvesm status 2>/dev/null | grep -q "^local-lvm"; then
+  if pvesm status 2>/dev/null | grep -q "^local-zfs"; then
+    LXC_STORAGE="local-zfs"
+    log "  Storage: local-zfs erkannt (ZFS-Installation)"
+  elif pvesm status 2>/dev/null | grep -q "^local "; then
+    LXC_STORAGE="local"
+    log "  Storage: local erkannt (dir-Storage)"
+  fi
+else
+  log "  Storage: local-lvm erkannt"
+fi
+# STORAGE in allen LXC-Scripts setzen
+sed -i "s|STORAGE=\"local-lvm\"|STORAGE=\"$LXC_STORAGE\"|g" "$SCRIPTS"/install-lxc-*.sh
+log "✓ Storage konfiguriert: $LXC_STORAGE"
+
 # ── Schritt 5: Basis-LXCs anlegen (parallel) ──────────────────────────────
 log_section "LXC 110 + 120 + 170: Parallel-Installation"
 log "Starte alle drei LXCs gleichzeitig..."

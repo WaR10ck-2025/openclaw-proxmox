@@ -165,8 +165,10 @@ else
     echo "  ℹ  Interaktiver Modus — answer.toml wird nicht injiziert (Wizard aktiv)"
   fi
 
-  # squashfs Installer-Dateisystem extrahieren (für first-boot Injection)
-  SQUASH_FILE=$(find "$WORK_DIR/iso-extract" -name "*.squashfs" -o -name "pve-base.squashfs" 2>/dev/null | head -1)
+  # squashfs Zielsystem extrahieren (pve-base = wird auf Disk installiert)
+  # pve-installer.squashfs = nur Installer-UI, wird NICHT auf Disk kopiert!
+  SQUASH_FILE=$(find "$WORK_DIR/iso-extract" -name "pve-base.squashfs" 2>/dev/null | head -1)
+  [ -z "$SQUASH_FILE" ] && SQUASH_FILE=$(find "$WORK_DIR/iso-extract" -name "*.squashfs" 2>/dev/null | grep -v installer | head -1)
 
   if [ -z "$SQUASH_FILE" ]; then
     echo "  ℹ  squashfs nicht gefunden — first-boot Scripts werden via Git geklont"
