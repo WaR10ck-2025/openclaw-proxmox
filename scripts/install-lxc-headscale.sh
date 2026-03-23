@@ -72,8 +72,8 @@ if ! command -v headscale &>/dev/null; then
     | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/' || echo "0.23.0")
   echo "  Version: \$HEADSCALE_VERSION"
 
-  curl -fsSL "https://github.com/juanfont/headscale/releases/latest/download/headscale_linux_amd64" \
-    -o /usr/local/bin/headscale
+  HEADSCALE_DL_URL="https://github.com/juanfont/headscale/releases/download/v\${HEADSCALE_VERSION}/headscale_\${HEADSCALE_VERSION}_linux_amd64"
+  curl -fsSL "\$HEADSCALE_DL_URL" -o /usr/local/bin/headscale
   chmod +x /usr/local/bin/headscale
   echo "  ✓ Headscale \$(headscale version) installiert"
 else
