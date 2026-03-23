@@ -108,14 +108,55 @@ class ProxmoxClient:
             "full": 1,
             "storage": LXC_STORAGE,
         })
-        # Warten bis Clone-Task abgeschlossen (Lock freigegeben)
         upid = result.get("data", "")
         if upid:
             self._wait_for_task(upid)
-        # Netzwerk setzen
         self._request("PUT", f"/nodes/{PROXMOX_NODE}/lxc/{new_id}/config", {
             "net0": f"name=eth0,bridge=vmbr0,ip={ip}/24,gw={LXC_GATEWAY}",
         })
+
+    def clone_template_for_user(
+        self,
+        new_id: int,
+        hostname: str,
+        ip: str,
+        bridge: str,
+        gateway: str,
+        template_id: int | None = None,
+    ) -> None:
+        """
+        Klont das User-CasaOS-Template (default: 9001) zu einem neuen LXC.
+        Setzt User-Bridge, User-Subnetz-IP + User-Gateway.
+        Privilegierter Modus (nesting + keyctl) für Docker + ZFS-Bindmounts.
+        """
+        tmpl = template_id or int(os.getenv("CASAOS_TEMPLATE_ID", "9001"))
+        result = self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{tmpl}/clone", {
+            "newid": new_id,
+            "hostname": hostname,
+            "full": 1,
+            "storage": LXC_STORAGE,
+        })
+        upid = result.get("data", "")
+        if upid:
+            self._wait_for_task(upid)
+        self._request("PUT", f"/nodes/{PROXMOX_NODE}/lxc/{new_id}/config", {
+            "net0": f"name=eth0,bridge={bridge},ip={ip}/24,gw={gateway}",
+            "features": "nesting=1,keyctl=1",
+            "unprivileged": 0,
+        })
+
+    def next_free_id_for_user(self, range_start: int, range_end: int) -> int:
+        """Nächste freie LXC-ID im gegebenen User-Bereich (range_start+1 bis range_end)."""
+        result = self._request("GET", f"/nodes/{PROXMOX_NODE}/lxc")
+        used = {
+            int(x["vmid"])
+            for x in result.get("data", [])
+            if range_start <= int(x["vmid"]) <= range_end
+        }
+        for i in range(range_start + 1, range_end + 1):
+            if i not in used:
+                return i
+        raise RuntimeError(f"Kein freier LXC-Slot {range_start + 1}–{range_end}")
 
     def start_lxc(self, lxc_id: int) -> None:
         self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}/status/start")

@@ -15,6 +15,13 @@ Endpunkte:
   GET    /casaos-store/Apps                  GitHub-API-kompatibler App-Index (für CasaOS)
   GET    /casaos-store/{app_id}/docker-compose.yml  Compose mit x-casaos Block (für CasaOS)
   GET    /health                             Liveness-Check
+
+  --- Admin-Endpoints (X-API-Key: $ADMIN_KEY erforderlich) ---
+  POST   /admin/users?username=X&quota=100G  User anlegen + provisionieren
+  GET    /admin/users                        Alle User auflisten
+  GET    /admin/users/{id}/status           User-Status + Zugangsdaten
+  GET    /admin/users/{id}/quota            ZFS-Quota + Nutzung
+  DELETE /admin/users/{id}                  User + alle Ressourcen entfernen
 """
 from __future__ import annotations
 import asyncio
@@ -24,13 +31,15 @@ import logging
 import textwrap
 import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 import app_resolver
 import lxc_manager
 import casaos_client
 import preconfigured_apps
+import user_manager
+from auth import require_admin, require_user_or_admin
 
 logger = logging.getLogger("casaos-lxc-bridge")
 logging.basicConfig(level=logging.INFO)
@@ -186,19 +195,39 @@ async def get_preconfigured():
 # ---------------------------------------------------------------------------
 
 @app.post("/bridge/install")
-async def install_app(appid: str = Query(..., description="App-ID (z.B. 'N8n', 'vaultwarden')")):
+async def install_app(
+    appid: str = Query(..., description="App-ID (z.B. 'N8n', 'vaultwarden')"),
+    caller_user_id: int | None = Depends(require_user_or_admin),
+):
     """
     Installiert eine App aus CasaOS- oder Umbrel-Store als isolierten Proxmox-LXC.
-    Für vorkonfigurierte Apps werden feste LXC-ID + IP verwendet.
-    Registriert die App anschließend im CasaOS-Dashboard.
+    Mit User-Key: App wird im User-Subnetz installiert (User-Scope).
+    Mit Admin-Key oder ohne Auth: Admin-Modus (vmbr0, bestehende Range 300–399).
     """
     try:
         meta = app_resolver.resolve(appid)
     except FileNotFoundError as e:
         raise HTTPException(404, detail=str(e))
 
-    fixed_lxc_id, fixed_ip = preconfigured_apps.get_fixed_params(appid)
+    if caller_user_id is not None:
+        # User-Scope: App in User-Subnetz + User-LXC-Range
+        try:
+            rec = await asyncio.to_thread(lxc_manager.install_for_user, meta, caller_user_id)
+        except RuntimeError as e:
+            raise HTTPException(409 if "bereits installiert" in str(e) else 500, detail=str(e))
+        return {
+            "success": True,
+            "app_id": rec.app_id,
+            "lxc_id": rec.lxc_id,
+            "ip": rec.ip,
+            "port": rec.port,
+            "url": f"http://{rec.ip}:{rec.port}",
+            "store_type": meta.store_type,
+            "user_id": caller_user_id,
+        }
 
+    # Admin-Modus: klassische Installation in vmbr0
+    fixed_lxc_id, fixed_ip = preconfigured_apps.get_fixed_params(appid)
     try:
         rec = await asyncio.to_thread(lxc_manager.install, meta, fixed_lxc_id, fixed_ip)
     except RuntimeError as e:
@@ -241,10 +270,15 @@ async def remove_app(appid: str = Query(..., description="App-ID")):
 
 
 @app.get("/bridge/list")
-async def list_apps():
-    """Alle bridge-verwalteten Apps mit aktuellem Status."""
+async def list_apps(
+    caller_user_id: int | None = Depends(require_user_or_admin),
+):
+    """Alle bridge-verwalteten Apps. User sieht nur eigene Apps."""
     await asyncio.to_thread(lxc_manager.sync_status)
-    apps = lxc_manager.list_apps()
+    if caller_user_id is not None:
+        apps = lxc_manager.list_apps_for_user(caller_user_id)
+    else:
+        apps = lxc_manager.list_apps()
     return {
         "count": len(apps),
         "apps": [
@@ -360,3 +394,75 @@ async def casaos_store_app(app_id: str):
 
     compose = _to_casaos_format(meta)
     return PlainTextResponse(compose, media_type="text/plain")
+
+
+# ---------------------------------------------------------------------------
+# Admin-Endpoints — nur mit X-API-Key: $ADMIN_KEY
+# ---------------------------------------------------------------------------
+
+@app.post("/admin/users")
+async def create_user(
+    username: str = Query(..., description="Eindeutiger Username"),
+    quota: str = Query("100G", description="ZFS-Quota z.B. '50G', '200G'"),
+    _: None = Depends(require_admin),
+):
+    """
+    Legt einen neuen User an und startet die vollständige Provisionierung.
+    Gibt user_id + api_key zurück. Provisionierung dauert ~5–10 Minuten.
+    """
+    try:
+        result = await asyncio.to_thread(user_manager.provision_user, username, quota)
+    except RuntimeError as e:
+        raise HTTPException(409 if "vergeben" in str(e) else 500, detail=str(e))
+    return result
+
+
+@app.get("/admin/users")
+async def admin_list_users(_: None = Depends(require_admin)):
+    """Alle User mit Status auflisten."""
+    users = user_manager.list_users()
+    return {"count": len(users), "users": users}
+
+
+@app.get("/admin/users/{user_id}/status")
+async def admin_user_status(
+    user_id: int,
+    _: None = Depends(require_admin),
+):
+    """Detaillierter User-Status inkl. CasaOS-URL, SMB-Shares, VPN-Infos."""
+    try:
+        return user_manager.get_user(user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e))
+
+
+@app.get("/admin/users/{user_id}/quota")
+async def admin_user_quota(
+    user_id: int,
+    _: None = Depends(require_admin),
+):
+    """ZFS-Quota + aktueller Speicherverbrauch des Users."""
+    try:
+        return await asyncio.to_thread(user_manager.get_user_quota, user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(
+    user_id: int,
+    _: None = Depends(require_admin),
+):
+    """
+    Löscht User + alle Ressourcen (LXCs, ZFS-Datasets, Bridge, iptables-Regeln).
+    Fehler-tolerant: einzelne fehlschlagende Cleanup-Schritte werden geloggt.
+    """
+    try:
+        await asyncio.to_thread(user_manager.deprovision_user, user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, detail=str(e))
+    return {"success": True, "user_id": user_id, "message": "User + alle Ressourcen entfernt"}

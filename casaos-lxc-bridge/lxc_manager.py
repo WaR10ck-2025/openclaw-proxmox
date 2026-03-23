@@ -33,6 +33,8 @@ def _get_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
+    # --- apps-Tabelle (original) ---
     conn.execute("""
         CREATE TABLE IF NOT EXISTS apps (
             app_id   TEXT PRIMARY KEY,
@@ -43,6 +45,36 @@ def _get_db() -> sqlite3.Connection:
             status   TEXT
         )
     """)
+
+    # --- users-Tabelle (Multi-Tenant) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            username          TEXT UNIQUE NOT NULL,
+            api_key           TEXT UNIQUE NOT NULL,
+            lxc_range_start   INTEGER NOT NULL,
+            lxc_range_end     INTEGER NOT NULL,
+            bridge            TEXT NOT NULL,
+            subnet            TEXT NOT NULL,
+            gateway           TEXT NOT NULL,
+            casaos_lxc_id     INTEGER,
+            casaos_url        TEXT,
+            casaos_token      TEXT,
+            zfs_dataset       TEXT,
+            zfs_quota         TEXT DEFAULT '100G',
+            smb_password      TEXT,
+            tailscale_auth_key TEXT,
+            headscale_namespace TEXT,
+            status            TEXT DEFAULT 'provisioning',
+            provisioning_step TEXT DEFAULT ''
+        )
+    """)
+
+    # --- Migration: user_id zu apps hinzufügen (idempotent) ---
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(apps)").fetchall()}
+    if "user_id" not in cols:
+        conn.execute("ALTER TABLE apps ADD COLUMN user_id INTEGER REFERENCES users(user_id)")
+
     conn.commit()
     return conn
 
@@ -157,6 +189,113 @@ def sync_status() -> None:
         except Exception:
             conn.execute("UPDATE apps SET status='error' WHERE app_id=?", (row["app_id"],))
     conn.commit()
+
+
+def install_for_user(
+    meta: AppMeta,
+    user_id: int,
+) -> AppRecord:
+    """
+    Installiert eine App im User-Scope:
+      - IP + LXC-ID aus User-Subnetz (10.U.0.20+)
+      - Bridge = vmbrU
+      - App-Record mit user_id verknüpft
+
+    Schlägt fehl wenn User nicht 'ready' ist.
+    """
+    conn = _get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE user_id=? AND status='ready'", (user_id,)
+    ).fetchone()
+    if not user:
+        raise RuntimeError(f"User {user_id} nicht gefunden oder nicht bereit")
+
+    proxmox = ProxmoxClient()
+    bridge = user["bridge"]
+    gateway = user["gateway"]
+    subnet_prefix = f"10.{user_id}.0"
+
+    # Bereits installierte App-IPs im User-Subnetz sammeln
+    used_ips = {
+        row["ip"]
+        for row in conn.execute(
+            "SELECT ip FROM apps WHERE user_id=?", (user_id,)
+        ).fetchall()
+    }
+    # .20 bis .118 → max 99 Apps pro User
+    ip = None
+    for offset in range(99):
+        candidate = f"{subnet_prefix}.{20 + offset}"
+        if candidate not in used_ips:
+            ip = candidate
+            break
+    if not ip:
+        raise RuntimeError(f"Kein freier IP-Slot im Subnetz {subnet_prefix}.0/24 für User {user_id}")
+
+    lxc_id = proxmox.next_free_id_for_user(user["lxc_range_start"], user["lxc_range_end"])
+    hostname = f"u{user_id}-{meta.app_id.lower().replace('_', '-')}"
+
+    # Eindeutiger app_id-Key pro User: "alice__vaultwarden"
+    scoped_app_id = f"u{user_id}__{meta.app_id}"
+
+    row = conn.execute("SELECT status FROM apps WHERE app_id=?", (scoped_app_id,)).fetchone()
+    if row and row["status"] in ("running", "installing"):
+        raise RuntimeError(f"App '{meta.app_id}' für User {user_id} bereits installiert")
+
+    rec = AppRecord(
+        app_id=scoped_app_id, lxc_id=lxc_id, ip=ip,
+        hostname=hostname, port=meta.port, status="installing"
+    )
+    conn.execute("""
+        INSERT INTO apps (app_id, lxc_id, ip, hostname, port, status, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_id) DO UPDATE SET
+            lxc_id=excluded.lxc_id, ip=excluded.ip, hostname=excluded.hostname,
+            port=excluded.port, status=excluded.status, user_id=excluded.user_id
+    """, (rec.app_id, rec.lxc_id, rec.ip, rec.hostname, rec.port, rec.status, user_id))
+    conn.commit()
+
+    try:
+        proxmox.clone_template_for_user(lxc_id, hostname, ip, bridge, gateway)
+        proxmox.start_lxc(lxc_id)
+        _wait_for_network(ip)
+
+        app_dir = f"/opt/{meta.app_id}"
+        compose_content = _patch_compose(meta, ip=ip)
+        proxmox.exec_in_lxc(lxc_id, f"mkdir -p {app_dir}")
+        proxmox.push_file_to_lxc(lxc_id, compose_content, f"{app_dir}/docker-compose.yml")
+        proxmox.exec_in_lxc(lxc_id, f"cd {app_dir} && docker compose up -d")
+
+        # Optional: Tailscale registrieren
+        tailscale_key = user["tailscale_auth_key"]
+        if tailscale_key:
+            headscale_url = os.getenv("HEADSCALE_URL", "http://192.168.10.115:8080")
+            try:
+                proxmox.exec_in_lxc(lxc_id,
+                    f"which tailscale || (curl -fsSL https://tailscale.com/install.sh | sh); "
+                    f"tailscale up --login-server={headscale_url} "
+                    f"--authkey={tailscale_key} --accept-routes=false --accept-dns=false"
+                )
+            except Exception:
+                pass  # Tailscale ist optional
+
+        rec.status = "running"
+        conn.execute("UPDATE apps SET status='running' WHERE app_id=?", (rec.app_id,))
+        conn.commit()
+
+    except Exception as e:
+        conn.execute("UPDATE apps SET status='error' WHERE app_id=?", (rec.app_id,))
+        conn.commit()
+        raise RuntimeError(f"Install fehlgeschlagen: {e}") from e
+
+    return rec
+
+
+def list_apps_for_user(user_id: int) -> list[AppRecord]:
+    """Alle Apps eines Users aus DB."""
+    conn = _get_db()
+    rows = conn.execute("SELECT * FROM apps WHERE user_id=?", (user_id,)).fetchall()
+    return [AppRecord(**{k: r[k] for k in ("app_id", "lxc_id", "ip", "hostname", "port", "status")}) for r in rows]
 
 
 def _wait_for_network(ip: str, timeout: int = 60) -> None:
