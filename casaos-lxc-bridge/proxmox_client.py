@@ -151,11 +151,16 @@ class ProxmoxClient:
         upid = result.get("data", "")
         if upid:
             self._wait_for_task(upid)
+
+        # Netzwerk + Hostname via API (keine root@pam-Rechte nötig)
         self._request("PUT", f"/nodes/{PROXMOX_NODE}/lxc/{new_id}/config", {
             "net0": f"name=eth0,bridge={bridge},ip={ip}/24,gw={gateway}",
-            "features": "nesting=1,keyctl=1",
-            "unprivileged": 0,
+            "hostname": hostname,
         })
+        # Privilegiert + Features via SSH (erfordert root@pam, daher nicht via API)
+        self._ssh_run(
+            f"pct set {new_id} --unprivileged 0 --features 'nesting=1,keyctl=1'"
+        )
 
     def next_free_id_for_user(self, range_start: int, range_end: int) -> int:
         """Nächste freie LXC-ID im gegebenen User-Bereich (range_start+1 bis range_end)."""
