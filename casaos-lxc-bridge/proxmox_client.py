@@ -130,6 +130,18 @@ class ProxmoxClient:
         Privilegierter Modus (nesting + keyctl) für Docker + ZFS-Bindmounts.
         """
         tmpl = template_id or int(os.getenv("CASAOS_TEMPLATE_ID", "9001"))
+
+        # Template muss gestoppt sein für Full-Clone (Proxmox-Anforderung)
+        tmpl_status = self._request("GET", f"/nodes/{PROXMOX_NODE}/lxc/{tmpl}/status/current")
+        if tmpl_status.get("data", {}).get("status") == "running":
+            self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{tmpl}/status/stop")
+            import time
+            for _ in range(30):
+                s = self._request("GET", f"/nodes/{PROXMOX_NODE}/lxc/{tmpl}/status/current")
+                if s.get("data", {}).get("status") == "stopped":
+                    break
+                time.sleep(1)
+
         result = self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{tmpl}/clone", {
             "newid": new_id,
             "hostname": hostname,
