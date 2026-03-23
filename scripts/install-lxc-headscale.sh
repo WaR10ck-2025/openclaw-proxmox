@@ -101,7 +101,14 @@ prefixes:
 
 derp:
   server:
-    enabled: false
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: Headscale Embedded DERP
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+    ipv4: ${LXC_IP}
   urls: []
   auto_update_enabled: false
   update_frequency: 24h
@@ -117,7 +124,8 @@ database:
 log:
   level: info
 
-acl_policy_path: /etc/headscale/acls.yaml
+policy:
+  path: /etc/headscale/acls.yaml
 dns:
   nameservers:
     global:
@@ -130,15 +138,8 @@ fi
 # ACL: alle Namespaces dürfen sich gegenseitig NICHT erreichen
 # (Tailscale-Clients in verschiedenen Namespaces sind getrennt)
 if [ ! -f /etc/headscale/acls.yaml ]; then
-  cat > /etc/headscale/acls.yaml << 'ACLCONF'
----
-acls:
-  - action: accept
-    src:
-      - "*"
-    dst:
-      - "*:*"
-ACLCONF
+  # HuJSON Format (kein YAML!) — Headscale 0.24+
+  echo '{"acls": [{"action": "accept", "src": ["*"], "dst": ["*:*"]}]}' > /etc/headscale/acls.yaml
   echo "  ✓ acls.yaml erstellt (open policy — User-Isolation via Namespace)"
 fi
 
