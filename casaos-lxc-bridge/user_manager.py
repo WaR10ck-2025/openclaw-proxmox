@@ -298,10 +298,23 @@ def _setup_headscale_namespace(proxmox: ProxmoxClient, username: str) -> str:
     proxmox._ssh_run(
         f"pct exec {HEADSCALE_LXC_ID} -- {HS} users create {username} 2>/dev/null || true"
     )
-    # Pre-Auth-Key generieren (reusable, kein Ablauf)
+    # User-ID ermitteln (Headscale 0.28+ braucht numerische ID)
+    id_result = proxmox._ssh_run(
+        f"pct exec {HEADSCALE_LXC_ID} -- {HS} users list --output json"
+    )
+    hs_user_id = "1"  # Fallback
+    if id_result.returncode == 0 and id_result.stdout.strip():
+        import json as _json
+        for u in _json.loads(id_result.stdout):
+            if u.get("name") == username:
+                hs_user_id = str(u["id"])
+                break
+
+    # Pre-Auth-Key generieren (reusable, 10 Jahre Laufzeit)
+    # --expiration 0 würde sofort ablaufen — 87600h = ~10 Jahre
     result = proxmox._ssh_run(
         f"pct exec {HEADSCALE_LXC_ID} -- {HS} preauthkeys create "
-        f"--user {username} --reusable --expiration 0 --output json"
+        f"--user {hs_user_id} --reusable --expiration 87600h --output json"
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError(f"Headscale preauthkey create fehlgeschlagen: {result.stderr}")
@@ -310,9 +323,34 @@ def _setup_headscale_namespace(proxmox: ProxmoxClient, username: str) -> str:
 
 
 def _install_tailscale_in_lxc(proxmox: ProxmoxClient, lxc_id: int, auth_key: str) -> None:
-    """Installiert Tailscale-Client im LXC + registriert beim Headscale-Server."""
+    """
+    Installiert Tailscale-Client im LXC + registriert beim Headscale-Server.
+    Aktiviert /dev/net/tun via lxc.conf (Proxmox 8.x).
+    """
+    import time
+
+    # TUN-Device in LXC-Config aktivieren (Proxmox 8: kein tun= Feature-Flag)
+    proxmox._ssh_run(
+        f"grep -q 'dev/net/tun' /etc/pve/lxc/{lxc_id}.conf || "
+        f"echo 'lxc.cgroup2.devices.allow: c 10:200 rwm\\n"
+        f"lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file' "
+        f">> /etc/pve/lxc/{lxc_id}.conf"
+    )
+    # LXC neu starten damit TUN-Device verfügbar wird
+    proxmox._ssh_run(f"pct stop {lxc_id} && sleep 3 && pct start {lxc_id}")
+    time.sleep(10)  # Warten bis Container-Init abgeschlossen
+
+    # Tailscale installieren falls nicht vorhanden
     proxmox.exec_in_lxc(lxc_id,
-        "which tailscale 2>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh; "
+        "which tailscale 2>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh"
+    )
+
+    # tailscaled starten
+    proxmox._ssh_run(f"pct exec {lxc_id} -- systemctl restart tailscaled")
+    time.sleep(5)
+
+    # Bei Headscale registrieren
+    proxmox.exec_in_lxc(lxc_id,
         f"tailscale up --login-server={HEADSCALE_URL} --authkey={auth_key} "
         "--accept-routes --accept-dns=false"
     )
