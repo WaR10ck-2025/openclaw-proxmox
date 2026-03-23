@@ -48,6 +48,7 @@ logging.basicConfig(level=logging.INFO)
 
 BRIDGE_URL = os.getenv("BRIDGE_URL", "http://192.168.10.141:8200")
 BRIDGE_LXC_ID = int(os.getenv("BRIDGE_LXC_ID", "120"))
+STORE_AUTHOR = os.getenv("STORE_AUTHOR", "OpenClaw")
 
 # ---------------------------------------------------------------------------
 # Katalog-Cache: wird beim Start befüllt + alle 6h refreshed
@@ -89,6 +90,8 @@ def _build_store_zip_sync(apps: list) -> bytes:
                 if not _is_casaos_compatible(compose):
                     skipped += 1
                     continue
+                # Root-level x-casaos author überschreiben (2-Space-Indent)
+                compose = re.sub(r'^  author:.*$', f'  author: {STORE_AUTHOR}', compose, flags=re.MULTILINE)
                 zf.writestr(f"casaos-store/Apps/{app_id}/docker-compose.yml", compose)
                 included += 1
             except Exception:
