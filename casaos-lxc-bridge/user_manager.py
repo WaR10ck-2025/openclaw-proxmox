@@ -29,7 +29,7 @@ from proxmox_client import ProxmoxClient
 from network_manager import create_bridge, destroy_bridge, get_user_network, get_user_casaos_ip
 from zfs_manager import create_user_dataset, mount_dataset_in_lxc, destroy_user_dataset
 from auth import generate_api_key
-from lxc_manager import _get_db, _wait_for_network
+from lxc_manager import _get_db
 
 logger = logging.getLogger(__name__)
 
@@ -110,10 +110,10 @@ def provision_user(username: str, quota: str = "100G") -> dict:
         _set_step(conn, user_id, "mounting_zfs_datasets")
         mount_dataset_in_lxc(username, casaos_lxc_id, proxmox)
 
-        # Schritt 6: LXC starten + auf Netzwerk warten
+        # Schritt 6: LXC starten + warten bis bereit (via pct exec — kein direkter TCP-Connect)
         _set_step(conn, user_id, "starting_casaos_lxc")
         proxmox.start_lxc(casaos_lxc_id)
-        _wait_for_network(casaos_ip, timeout=120)
+        proxmox.wait_for_lxc_ready(casaos_lxc_id, timeout=120)
 
         # Schritt 7: Bridge-Env in LXC deployen (docker compose up)
         _set_step(conn, user_id, "deploying_bridge_env")

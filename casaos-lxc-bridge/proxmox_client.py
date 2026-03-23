@@ -207,6 +207,21 @@ class ProxmoxClient:
             except OSError:
                 pass
 
+    def wait_for_lxc_ready(self, lxc_id: int, timeout: int = 120) -> None:
+        """
+        Wartet bis der LXC bereit ist — via pct exec auf dem Proxmox-Host.
+        Umgeht Netzwerk-Isolation: kein direkter TCP-Connect nötig.
+        """
+        import time
+        for _ in range(timeout):
+            result = self._ssh_run(
+                f"pct exec {lxc_id} -- test -f /etc/hostname 2>/dev/null && echo ok || echo wait"
+            )
+            if result.returncode == 0 and "ok" in result.stdout:
+                return
+            time.sleep(1)
+        raise TimeoutError(f"LXC {lxc_id} nicht bereit nach {timeout}s")
+
     def exec_in_lxc(self, lxc_id: int, command: str) -> None:
         """Führt Shell-Befehl im LXC aus — via SSH + pct exec, Befehl base64-kodiert."""
         import base64
