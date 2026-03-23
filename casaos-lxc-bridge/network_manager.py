@@ -20,6 +20,12 @@ import textwrap
 HEADSCALE_LXC_IP = os.getenv("HEADSCALE_LXC_IP", "192.168.10.115")
 HEADSCALE_PORT = int(os.getenv("HEADSCALE_PORT", "8080"))
 TAILSCALE_ENABLED = os.getenv("TAILSCALE_ENABLED", "true").lower() == "true"
+MGMT_IP_BASE = int(os.getenv("USER_MGMT_IP_BASE", "149"))
+
+
+def get_user_mgmt_ip(user_id: int) -> str:
+    """Management-IP für LAN-Zugang: User 1 → 192.168.10.150, User 4 → 192.168.10.153"""
+    return f"192.168.10.{MGMT_IP_BASE + user_id}"
 
 
 def get_user_network(user_id: int) -> tuple[str, str, str]:
@@ -64,6 +70,9 @@ def create_bridge(user_id: int, proxmox) -> str:
             f"-m comment --comment openclaw-user-{u}-headscale\n"
         )
 
+    mgmt_ip = get_user_mgmt_ip(u)
+    casaos_ip = get_user_casaos_ip(u)
+
     iface_block = textwrap.dedent(f"""
 
         auto {bridge}
@@ -82,7 +91,14 @@ def create_bridge(user_id: int, proxmox) -> str:
             post-up   iptables -I FORWARD 1 -i {bridge} -d 10.0.0.0/8 -j DROP -m comment --comment openclaw-user-{u}-iso
             post-up   iptables -I FORWARD 1 -i {bridge} -d 192.168.10.0/24 -j DROP -m comment --comment openclaw-user-{u}-mgmt
     """) + headscale_line + textwrap.dedent(f"""
+            # Lokaler LAN-Zugang: IP-Alias + DNAT → 10.{u}.0.10
+            post-up   ip addr add {mgmt_ip}/32 dev vmbr0 2>/dev/null || true
+            post-up   iptables -t nat -A PREROUTING -d {mgmt_ip} -j DNAT --to-destination {casaos_ip} -m comment --comment openclaw-user-{u}-dnat
+            post-up   iptables -t nat -A POSTROUTING -s {casaos_ip} -o vmbr0 -j SNAT --to-source {mgmt_ip} -m comment --comment openclaw-user-{u}-snat
+            post-up   iptables -A FORWARD -i vmbr0 -o {bridge} -d {casaos_ip} -j ACCEPT -m comment --comment openclaw-user-{u}-mgmt-fwd
+            post-up   iptables -I FORWARD 1 -i {bridge} -o vmbr0 -m state --state ESTABLISHED,RELATED -j ACCEPT -m comment --comment openclaw-user-{u}-est
             # Cleanup
+            post-down ip addr del {mgmt_ip}/32 dev vmbr0 2>/dev/null || true
             post-down iptables -t nat -D POSTROUTING -s 10.{u}.0.0/24 -o vmbr0 -j MASQUERADE -m comment --comment openclaw-user-{u} || true
     """)
 
@@ -111,7 +127,11 @@ def destroy_bridge(user_id: int, proxmox) -> None:
         f"open('/etc/network/interfaces', 'w').write(cleaned)"
         f"\" 2>/dev/null || true"
     )
-    # iptables-Regeln mit User-Kommentar entfernen
+    # iptables-Regeln mit User-Kommentar entfernen (inkl. NAT + FORWARD)
     proxmox._ssh_run(
         f"iptables-save | grep -v 'openclaw-user-{user_id}' | iptables-restore 2>/dev/null || true"
+    )
+    # Management-IP-Alias entfernen
+    proxmox._ssh_run(
+        f"ip addr del {get_user_mgmt_ip(user_id)}/32 dev vmbr0 2>/dev/null || true"
     )

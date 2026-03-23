@@ -26,7 +26,7 @@ import json
 import secrets
 import logging
 from proxmox_client import ProxmoxClient
-from network_manager import create_bridge, destroy_bridge, get_user_network, get_user_casaos_ip
+from network_manager import create_bridge, destroy_bridge, get_user_network, get_user_casaos_ip, get_user_mgmt_ip
 from zfs_manager import create_user_dataset, mount_dataset_in_lxc, destroy_user_dataset
 from auth import generate_api_key
 from lxc_manager import _get_db
@@ -88,9 +88,12 @@ def provision_user(username: str, quota: str = "100G") -> dict:
     proxmox = ProxmoxClient()
 
     try:
-        # Schritt 2: Netzwerk-Bridge anlegen
+        # Schritt 2: Netzwerk-Bridge anlegen (inkl. DNAT für lokale 192.168.10.x-Erreichbarkeit)
         _set_step(conn, user_id, "creating_bridge")
         create_bridge(user_id, proxmox)
+        mgmt_ip = get_user_mgmt_ip(user_id)
+        conn.execute("UPDATE users SET casaos_mgmt_ip=? WHERE user_id=?", (mgmt_ip, user_id))
+        conn.commit()
 
         # Schritt 3: ZFS-Datasets anlegen
         _set_step(conn, user_id, "creating_zfs_datasets")
@@ -375,6 +378,8 @@ def _user_to_dict(row) -> dict:
         "gateway": row["gateway"],
         "casaos_lxc_id": row["casaos_lxc_id"],
         "casaos_url": row["casaos_url"],
+        "casaos_mgmt_ip": row["casaos_mgmt_ip"],
+        "local_url": f"http://{row['casaos_mgmt_ip']}" if row["casaos_mgmt_ip"] else None,
         "zfs_dataset": row["zfs_dataset"],
         "zfs_quota": row["zfs_quota"],
         "smb_password": row["smb_password"],
@@ -389,10 +394,11 @@ def _user_to_dict(row) -> dict:
 def _smb_shares(row) -> dict | None:
     if not row["casaos_url"]:
         return None
-    ip = row["casaos_url"].replace("http://", "")
+    # Lokale Management-IP bevorzugen (192.168.10.x), Fallback auf internen IP
+    display_ip = row["casaos_mgmt_ip"] or row["casaos_url"].replace("http://", "")
     return {
-        "files":   f"\\\\{ip}\\files",
-        "appdata": f"\\\\{ip}\\appdata",
+        "files":   f"\\\\{display_ip}\\files",
+        "appdata": f"\\\\{display_ip}\\appdata",
         "user":    "casaos",
         "password": row["smb_password"],
     }

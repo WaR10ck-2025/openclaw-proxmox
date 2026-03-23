@@ -75,6 +75,11 @@ def _get_db() -> sqlite3.Connection:
     if "user_id" not in cols:
         conn.execute("ALTER TABLE apps ADD COLUMN user_id INTEGER REFERENCES users(user_id)")
 
+    # --- Migration: casaos_mgmt_ip zu users hinzufügen (idempotent) ---
+    ucols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "casaos_mgmt_ip" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN casaos_mgmt_ip TEXT")
+
     conn.commit()
     return conn
 

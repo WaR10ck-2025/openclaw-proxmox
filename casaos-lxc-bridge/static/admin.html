@@ -385,16 +385,17 @@
 
     users.forEach(u => {
       const isExpanded = expandedUser === u.user_id;
-      const localIp = u.casaos_url ? u.casaos_url.replace('http://', '') : null;
+      const displayIp = u.casaos_mgmt_ip || (u.casaos_url ? u.casaos_url.replace('http://', '') : null);
+      const displayUrl = u.local_url || u.casaos_url;
       html += `<tr id="row-${u.user_id}">
         <td>
           <span class="user-name">${esc(u.username)}</span>
           <span class="user-id"> #${u.user_id}</span>
         </td>
         <td>${statusBadge(u)}</td>
-        <td>${localIp
-              ? `<span style="font-family:monospace;font-size:.85rem;color:var(--text)">${esc(localIp)}</span>
-                 <a href="${esc(u.casaos_url)}" target="_blank"
+        <td>${displayIp
+              ? `<span style="font-family:monospace;font-size:.85rem;color:var(--text)">${esc(displayIp)}</span>
+                 <a href="${esc(displayUrl)}" target="_blank"
                     style="color:var(--muted);font-size:.75rem;margin-left:6px" title="Im Browser öffnen">↗</a>`
               : '<span style="color:var(--muted);font-size:.85rem">—</span>'
             }</td>
@@ -468,10 +469,12 @@
 
   /* ── Detail-Panel HTML ──────────────────────────────────────── */
   function buildDetail(u) {
-    const ip = u.casaos_url ? u.casaos_url.replace('http://', '') : '—';
+    const mgmtIp = u.casaos_mgmt_ip || (u.casaos_url ? u.casaos_url.replace('http://', '') : null);
+    const ip = mgmtIp || '—';
+    const openUrl = u.local_url || u.casaos_url;
     const smb = u.smb_shares || {};
     const vpn = u.vpn || {};
-    const smbUri = smb.password
+    const smbUri = smb.password && ip !== '—'
       ? `smb://casaos:${smb.password}@${ip}/files`
       : null;
 
@@ -479,9 +482,9 @@
       <!-- Lokale Adresse + API-Key -->
       <div class="api-key-row">
         <label>Lok. Adresse</label>
-        <div class="key-val">${esc(ip !== '—' ? ip : '—')}</div>
+        <div class="key-val">${esc(ip)}</div>
         ${ip !== '—' ? `<button class="btn btn-ghost btn-sm" onclick="copy(${JSON.stringify(ip)}, this)">📋</button>
-        <a href="${esc(u.casaos_url)}" target="_blank" class="btn btn-ghost btn-sm" style="text-decoration:none">↗</a>` : ''}
+        <a href="${esc(openUrl)}" target="_blank" class="btn btn-ghost btn-sm" style="text-decoration:none">↗</a>` : ''}
       </div>
       <div class="api-key-row">
         <label>API-Key</label>
@@ -546,7 +549,7 @@
           </div>
         </div>` : ''}
 
-        ${u.casaos_url ? `
+        ${openUrl ? `
         <div class="qr-card">
           <h3>🏠 CasaOS Dashboard</h3>
           <div class="qr-inner">
@@ -554,10 +557,10 @@
             <div class="qr-info">
               <div class="info-row">
                 <label>URL</label>
-                <span class="info-val">${esc(u.casaos_url)}</span>
+                <span class="info-val">${esc(openUrl)}</span>
               </div>
               <div style="margin-top:10px">
-                <a class="link-btn" href="${esc(u.casaos_url)}" target="_blank">
+                <a class="link-btn" href="${esc(openUrl)}" target="_blank">
                   Im Browser öffnen →
                 </a>
               </div>
@@ -574,7 +577,8 @@
 
   /* ── QR-Codes generieren ────────────────────────────────────── */
   function generateQRs(userId, u) {
-    const ip = u.casaos_url ? u.casaos_url.replace('http://', '') : null;
+    const ip = u.casaos_mgmt_ip || (u.casaos_url ? u.casaos_url.replace('http://', '') : null);
+    const openUrl = u.local_url || u.casaos_url;
     const smb = u.smb_shares || {};
     const vpn = u.vpn || {};
 
@@ -584,8 +588,8 @@
     if (smb.password && ip) {
       makeQR(`qr-smb-${userId}`, `smb://casaos:${smb.password}@${ip}/files`);
     }
-    if (u.casaos_url) {
-      makeQR(`qr-casaos-${userId}`, u.casaos_url);
+    if (openUrl) {
+      makeQR(`qr-casaos-${userId}`, openUrl);
     }
   }
 
