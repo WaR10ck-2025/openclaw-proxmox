@@ -258,7 +258,7 @@ def install_for_user(
     try:
         proxmox.clone_template_for_user(lxc_id, hostname, ip, bridge, gateway)
         proxmox.start_lxc(lxc_id)
-        _wait_for_network(ip)
+        proxmox.wait_for_lxc_ready(lxc_id)  # via pct exec (kein TCP — funktioniert trotz Netz-Isolation)
 
         app_dir = f"/opt/{meta.app_id}"
         compose_content = _patch_compose(meta, ip=ip)

@@ -54,11 +54,12 @@ def create_bridge(user_id: int, proxmox) -> str:
     subnet, gateway, bridge = get_user_network(user_id)
     u = user_id
 
-    # Tailscale-Ausnahme: Zugang zum Headscale-Server erlauben
-    headscale_rule = ""
+    # Headscale-Ausnahme (optional): via -I FORWARD 1 NACH dem mgmt-DROP einfügen
+    # → landet an Pos.1 und überholt den mgmt-DROP (der auf Pos.2 rutscht)
+    headscale_line = ""
     if TAILSCALE_ENABLED:
-        headscale_rule = (
-            f"    post-up   iptables -A FORWARD -i {bridge} "
+        headscale_line = (
+            f"            post-up   iptables -I FORWARD 1 -i {bridge} "
             f"-d {HEADSCALE_LXC_IP} -p tcp --dport {HEADSCALE_PORT} -j ACCEPT "
             f"-m comment --comment openclaw-user-{u}-headscale\n"
         )
@@ -72,29 +73,18 @@ def create_bridge(user_id: int, proxmox) -> str:
             bridge-ports none
             bridge-stp off
             bridge-fd 0
-            # Internet: NAT/Masquerade
+            # Internet: ACCEPT + NAT appenden (am Ende der Chain)
             post-up   iptables -t nat -A POSTROUTING -s 10.{u}.0.0/24 -o vmbr0 -j MASQUERADE -m comment --comment openclaw-user-{u}
             post-up   iptables -A FORWARD -i {bridge} -o vmbr0 -j ACCEPT -m comment --comment openclaw-user-{u}
             post-up   iptables -A FORWARD -i vmbr0 -o {bridge} -m state --state RELATED,ESTABLISHED -j ACCEPT -m comment --comment openclaw-user-{u}
-            # Isolation: Management-Netz (192.168.10.0/24) → DROP
-            post-up   iptables -A FORWARD -i {bridge} -d 192.168.10.0/24 -j DROP -m comment --comment openclaw-user-{u}-mgmt
-            # Isolation: andere User-Subnetze (10.0.0.0/8) → DROP
-            post-up   iptables -A FORWARD -i {bridge} -d 10.0.0.0/8 -j DROP -m comment --comment openclaw-user-{u}-iso
+            # Isolation via -I FORWARD 1: an Kettenanfang einfügen, überholt ACCEPT-Regeln
+            # Reihenfolge: iso DROP → mgmt DROP → HS-Ausnahme (jede überholt die vorherige)
+            post-up   iptables -I FORWARD 1 -i {bridge} -d 10.0.0.0/8 -j DROP -m comment --comment openclaw-user-{u}-iso
+            post-up   iptables -I FORWARD 1 -i {bridge} -d 192.168.10.0/24 -j DROP -m comment --comment openclaw-user-{u}-mgmt
+    """) + headscale_line + textwrap.dedent(f"""
             # Cleanup
             post-down iptables -t nat -D POSTROUTING -s 10.{u}.0.0/24 -o vmbr0 -j MASQUERADE -m comment --comment openclaw-user-{u} || true
     """)
-
-    # Headscale-Ausnahme VOR der 192.168.10.0/24-DROP-Regel einfügen
-    if headscale_rule:
-        # Ersetze die mgmt-DROP-Regel durch Ausnahme + DROP
-        iface_block = iface_block.replace(
-            f"            # Isolation: Management-Netz (192.168.10.0/24) → DROP\n"
-            f"            post-up   iptables -A FORWARD -i {bridge} -d 192.168.10.0/24 -j DROP -m comment --comment openclaw-user-{u}-mgmt\n",
-            f"            # Tailscale: Headscale-Zugang erlauben (vor Management-DROP)\n"
-            f"            post-up   iptables -A FORWARD -i {bridge} -d {HEADSCALE_LXC_IP} -p tcp --dport {HEADSCALE_PORT} -j ACCEPT -m comment --comment openclaw-user-{u}-headscale\n"
-            f"            # Isolation: Management-Netz (192.168.10.0/24) → DROP\n"
-            f"            post-up   iptables -A FORWARD -i {bridge} -d 192.168.10.0/24 -j DROP -m comment --comment openclaw-user-{u}-mgmt\n"
-        )
 
     proxmox._ssh_run(
         f"grep -q 'auto {bridge}' /etc/network/interfaces || "

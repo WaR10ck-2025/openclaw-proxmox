@@ -182,7 +182,8 @@ class ProxmoxClient:
         self._request("POST", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}/status/stop")
 
     def destroy_lxc(self, lxc_id: int) -> None:
-        self._request("DELETE", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}", {"purge": 1})
+        # purge als Query-Parameter (DELETE hat keinen Body in der Proxmox API)
+        self._request("DELETE", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}?purge=1")
 
     def get_lxc_status(self, lxc_id: int) -> str:
         result = self._request("GET", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}/status/current")
