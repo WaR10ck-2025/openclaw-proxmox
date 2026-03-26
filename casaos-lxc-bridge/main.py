@@ -495,6 +495,7 @@ async def casaos_store_zip(request: Request):
 async def create_user(
     username: str = Query(..., description="Eindeutiger Username"),
     quota: str = Query("100G", description="ZFS-Quota z.B. '50G', '200G'"),
+    storage_tier: str = Query("premium", description="'premium' (SSD) | 'standard' (HDD)"),
     _: None = Depends(require_admin),
 ):
     """
@@ -502,7 +503,9 @@ async def create_user(
     Gibt user_id + api_key zurück. Provisionierung dauert ~5–10 Minuten.
     """
     try:
-        result = await asyncio.to_thread(user_manager.provision_user, username, quota)
+        result = await asyncio.to_thread(
+            user_manager.provision_user, username, quota, storage_tier
+        )
     except RuntimeError as e:
         raise HTTPException(409 if "vergeben" in str(e) else 500, detail=str(e))
     return result
@@ -557,3 +560,239 @@ async def admin_delete_user(
     except RuntimeError as e:
         raise HTTPException(500, detail=str(e))
     return {"success": True, "user_id": user_id, "message": "User + alle Ressourcen entfernt"}
+
+
+# ---------------------------------------------------------------------------
+# Ressourcen-Management-Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/users/{user_id}/resources")
+async def admin_user_resources(
+    user_id: int,
+    _: None = Depends(require_admin),
+):
+    """CPU/RAM-Nutzung + ZFS-Quota eines Users (Live-Daten)."""
+    from proxmox_client import ProxmoxClient
+    from zfs_manager import get_dataset_usage
+    try:
+        user = user_manager.get_user(user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e))
+
+    proxmox = ProxmoxClient()
+    lxc_id = user.get("casaos_lxc_id")
+    dashboard_type = user.get("dashboard_type", "casaos")
+
+    vm_stats = {}
+    if lxc_id:
+        if dashboard_type == "ugos":
+            vm_stats = await asyncio.to_thread(proxmox.get_vm_resources, lxc_id)
+        else:
+            vm_stats = await asyncio.to_thread(proxmox.get_lxc_resources, lxc_id)
+
+    zfs_stats = await asyncio.to_thread(get_dataset_usage, user["username"], proxmox)
+    return {
+        "user_id": user_id,
+        "username": user["username"],
+        "dashboard": vm_stats,
+        "storage": zfs_stats,
+    }
+
+
+@app.put("/admin/users/{user_id}/resources")
+async def admin_update_resources(
+    user_id: int,
+    quota: str | None = Query(None, description="Neue ZFS-Quota z.B. '200G'"),
+    cores: int | None = Query(None, description="CPU-Kerne für Dashboard-VM/LXC"),
+    memory: int | None = Query(None, description="RAM in MB für Dashboard-VM/LXC"),
+    _: None = Depends(require_admin),
+):
+    """Ändert Ressourcen-Limits eines Users (Quota, CPU, RAM)."""
+    from proxmox_client import ProxmoxClient
+    from zfs_manager import set_dataset_quota
+    try:
+        user = user_manager.get_user(user_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e))
+
+    proxmox = ProxmoxClient()
+    changes = []
+
+    if quota:
+        await asyncio.to_thread(set_dataset_quota, user["username"], quota, proxmox)
+        from lxc_manager import _get_db
+        conn = _get_db()
+        conn.execute("UPDATE users SET zfs_quota=? WHERE user_id=?", (quota, user_id))
+        conn.commit()
+        changes.append(f"quota={quota}")
+
+    lxc_id = user.get("casaos_lxc_id")
+    if lxc_id and cores and memory:
+        dashboard_type = user.get("dashboard_type", "casaos")
+        if dashboard_type == "ugos":
+            await asyncio.to_thread(proxmox.set_vm_resources, lxc_id, cores, memory)
+        else:
+            await asyncio.to_thread(proxmox.set_lxc_resources, lxc_id, cores, memory)
+        changes.append(f"cores={cores}, memory={memory}MB")
+
+    return {"success": True, "user_id": user_id, "changes": changes}
+
+
+@app.get("/admin/resources/overview")
+async def admin_resources_overview(_: None = Depends(require_admin)):
+    """Ressourcen-Übersicht aller User (CPU/RAM/Disk aggregiert)."""
+    from proxmox_client import ProxmoxClient
+    from zfs_manager import get_dataset_usage
+    users = user_manager.list_users()
+    proxmox = ProxmoxClient()
+    overview = []
+    for u in users:
+        lxc_id = u.get("casaos_lxc_id")
+        dashboard_type = u.get("dashboard_type", "casaos")
+        vm_stats = {}
+        if lxc_id:
+            try:
+                if dashboard_type == "ugos":
+                    vm_stats = proxmox.get_vm_resources(lxc_id)
+                else:
+                    vm_stats = proxmox.get_lxc_resources(lxc_id)
+            except Exception:
+                pass
+        zfs_stats = {}
+        try:
+            zfs_stats = get_dataset_usage(u["username"], proxmox)
+        except Exception:
+            pass
+        overview.append({
+            "user_id": u["user_id"],
+            "username": u["username"],
+            "status": u["status"],
+            "dashboard_type": dashboard_type,
+            "cpu_percent": vm_stats.get("cpu_percent", 0),
+            "mem_used_bytes": vm_stats.get("mem_used_bytes", 0),
+            "mem_total_bytes": vm_stats.get("mem_total_bytes", 0),
+            "disk_used_gb": zfs_stats.get("used_gb", 0),
+            "disk_quota_gb": zfs_stats.get("quota_gb", 0),
+        })
+    return {"count": len(overview), "users": overview}
+
+
+# ---------------------------------------------------------------------------
+# Service-Anfrage-Endpoints (User → Admin Approval Flow)
+# ---------------------------------------------------------------------------
+
+@app.post("/bridge/apps/request")
+async def request_app(
+    appid: str = Query(..., description="App-ID aus dem Katalog"),
+    user=Depends(require_user_or_admin),
+):
+    """
+    User beantragt App-Installation. Bridge prüft Ressourcen-Limits:
+    - Genug freie Slots → direktes Installieren
+    - Limit überschritten → Anfrage an Admin (pending)
+    """
+    from lxc_manager import _get_db
+    conn = _get_db()
+    user_id = user["user_id"]
+
+    # Bereits laufende Anfragen prüfen
+    existing = conn.execute(
+        "SELECT id FROM app_requests WHERE user_id=? AND app_id=? AND status='pending'",
+        (user_id, appid)
+    ).fetchone()
+    if existing:
+        raise HTTPException(409, detail=f"Anfrage für '{appid}' bereits offen")
+
+    # App-Slots im User-Bereich prüfen
+    user_row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    used_slots = conn.execute(
+        "SELECT COUNT(*) as cnt FROM apps WHERE user_id=? AND status='running'",
+        (user_id,)
+    ).fetchone()["cnt"]
+    max_slots = int(os.getenv("USER_APP_SLOT_LIMIT", "10"))
+
+    if used_slots < max_slots:
+        # Direktes Installieren — Ressourcen verfügbar
+        try:
+            meta = await asyncio.to_thread(app_resolver.resolve, appid)
+            rec = await asyncio.to_thread(lxc_manager.install_for_user, meta, user_id)
+            return {"status": "installed", "app_id": appid, "ip": rec.ip}
+        except Exception as e:
+            raise HTTPException(500, detail=str(e))
+    else:
+        # Limit überschritten → Anfrage an Admin
+        conn.execute(
+            "INSERT INTO app_requests (user_id, app_id) VALUES (?, ?)",
+            (user_id, appid)
+        )
+        conn.commit()
+        return {
+            "status": "pending",
+            "message": f"Slot-Limit ({max_slots}) erreicht. Anfrage an Admin gesendet.",
+            "app_id": appid,
+        }
+
+
+@app.get("/admin/apps/requests")
+async def admin_list_requests(_: None = Depends(require_admin)):
+    """Alle offenen Service-Anfragen von Usern."""
+    from lxc_manager import _get_db
+    conn = _get_db()
+    rows = conn.execute("""
+        SELECT r.*, u.username
+        FROM app_requests r
+        JOIN users u ON r.user_id = u.user_id
+        WHERE r.status = 'pending'
+        ORDER BY r.requested_at ASC
+    """).fetchall()
+    return {
+        "count": len(rows),
+        "requests": [dict(r) for r in rows],
+    }
+
+
+@app.post("/admin/apps/requests/{request_id}/approve")
+async def admin_approve_request(
+    request_id: int,
+    _: None = Depends(require_admin),
+):
+    """Genehmigt eine App-Anfrage und startet die Installation."""
+    from lxc_manager import _get_db
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM app_requests WHERE id=? AND status='pending'", (request_id,)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, detail="Anfrage nicht gefunden oder bereits bearbeitet")
+
+    try:
+        meta = await asyncio.to_thread(app_resolver.resolve, row["app_id"])
+        rec = await asyncio.to_thread(lxc_manager.install_for_user, meta, row["user_id"])
+        conn.execute(
+            "UPDATE app_requests SET status='approved', reviewed_at=CURRENT_TIMESTAMP "
+            "WHERE id=?", (request_id,)
+        )
+        conn.commit()
+        return {"success": True, "app_id": row["app_id"], "ip": rec.ip}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+
+@app.post("/admin/apps/requests/{request_id}/deny")
+async def admin_deny_request(
+    request_id: int,
+    notes: str = Query("", description="Begründung"),
+    _: None = Depends(require_admin),
+):
+    """Lehnt eine App-Anfrage ab."""
+    from lxc_manager import _get_db
+    conn = _get_db()
+    result = conn.execute(
+        "UPDATE app_requests SET status='denied', reviewed_at=CURRENT_TIMESTAMP, notes=? "
+        "WHERE id=? AND status='pending'",
+        (notes, request_id)
+    )
+    conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(404, detail="Anfrage nicht gefunden oder bereits bearbeitet")
+    return {"success": True, "request_id": request_id}

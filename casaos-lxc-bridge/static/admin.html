@@ -267,7 +267,45 @@
 
 <!-- ── Main ───────────────────────────────────────────────────── -->
 <main id="mainContent" style="display:none">
-  <div class="section-header">
+  <!-- ── Ressourcen-Übersicht ──────────────────────────────── -->
+  <div class="section-header" style="margin-top:28px">
+    <h2>Ressourcen</h2>
+    <button class="btn btn-ghost btn-sm" onclick="loadResources()">⟳ Aktualisieren</button>
+  </div>
+  <div id="resourcesWrap" style="display:none">
+    <table class="user-table" id="resourcesTable">
+      <thead><tr>
+        <th>User</th>
+        <th>Dashboard</th>
+        <th>CPU</th>
+        <th>RAM</th>
+        <th>Speicher</th>
+      </tr></thead>
+      <tbody id="resourcesBody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── App-Anfragen ──────────────────────────────────────── -->
+  <div class="section-header" style="margin-top:28px">
+    <h2>App-Anfragen</h2>
+    <span class="count-badge" id="requestCount">0</span>
+    <button class="btn btn-ghost btn-sm" onclick="loadRequests()">⟳ Aktualisieren</button>
+  </div>
+  <div id="requestsWrap">
+    <div class="empty" id="requestsEmpty"><div class="big">📭</div>Keine offenen Anfragen.</div>
+    <table class="user-table" id="requestsTable" style="display:none">
+      <thead><tr>
+        <th>User</th>
+        <th>App-ID</th>
+        <th>Angefragt</th>
+        <th style="text-align:right">Aktionen</th>
+      </tr></thead>
+      <tbody id="requestsBody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── Users ─────────────────────────────────────────────── -->
+  <div class="section-header" style="margin-top:28px">
     <h2>Users</h2>
     <span class="count-badge" id="userCount">0</span>
     <button class="btn btn-primary btn-sm" onclick="openModal()">+ Neuer User</button>
@@ -310,15 +348,18 @@
   let detailCache    = {};     // user_id → full status object
 
   const STEPS = {
-    'creating_bridge':       'Netzwerk anlegen…',
-    'creating_zfs_datasets': 'Speicher anlegen…',
-    'cloning_casaos_lxc':    'CasaOS klonen…',
-    'mounting_zfs_datasets': 'Speicher einhängen…',
-    'starting_casaos_lxc':   'CasaOS starten…',
-    'deploying_bridge_env':  'Bridge deployen…',
-    'setting_up_headscale':  'VPN einrichten…',
-    'installing_tailscale':  'Tailscale installieren…',
-    'configuring_smb':       'SMB-Freigabe konfigurieren…',
+    'creating_bridge':         'Netzwerk anlegen…',
+    'creating_zfs_datasets':   'Speicher anlegen…',
+    'cloning_casaos_lxc':      'CasaOS klonen…',
+    'cloning_ugos_vm':         'UGOS-VM klonen…',
+    'mounting_zfs_datasets':   'Speicher einhängen…',
+    'starting_casaos_lxc':     'Dashboard starten…',
+    'deploying_bridge_env':    'Bridge deployen…',
+    'setting_up_headscale':    'VPN einrichten…',
+    'installing_tailscale':    'Tailscale installieren…',
+    'configuring_smb':         'SMB-Freigabe konfigurieren…',
+    'creating_sso_user':       'SSO-User anlegen…',
+    'creating_portainer_team': 'Portainer-Team anlegen…',
   };
 
   /* ── Auth ───────────────────────────────────────────────────── */
@@ -327,6 +368,8 @@
     if (val) { adminKey = val; sessionStorage.setItem('adminKey', val); }
     if (!adminKey) { toast('Admin-Key fehlt', 'err'); return; }
     await loadUsers();
+    loadResources();
+    loadRequests();
   }
 
   async function apiFetch(path, opts = {}) {
@@ -367,6 +410,84 @@
     }
   }
 
+  /* ── Ressourcen laden ───────────────────────────────────────── */
+  async function loadResources() {
+    try {
+      const data = await apiFetch('/admin/resources/overview');
+      const body = document.getElementById('resourcesBody');
+      if (!data.users || !data.users.length) { return; }
+      document.getElementById('resourcesWrap').style.display = '';
+      body.innerHTML = data.users.map(u => {
+        const cpuPct = u.cpu_percent || 0;
+        const memPct = u.mem_total_bytes ? Math.round(u.mem_used_bytes / u.mem_total_bytes * 100) : 0;
+        const diskPct = u.disk_quota_gb ? Math.round(u.disk_used_gb / u.disk_quota_gb * 100) : 0;
+        const bar = (pct, color) =>
+          `<div style="display:flex;align-items:center;gap:6px;min-width:100px">
+            <div style="flex:1;height:6px;background:var(--border);border-radius:3px">
+              <div style="width:${Math.min(pct,100)}%;height:100%;background:${color};border-radius:3px"></div>
+            </div>
+            <span style="font-size:.75rem;color:var(--muted);width:32px">${pct}%</span>
+          </div>`;
+        const dashIcon = u.dashboard_type === 'ugos' ? '🟠' : '🏠';
+        return `<tr>
+          <td><span class="user-name">${esc(u.username)}</span> <span class="user-id">#${u.user_id}</span></td>
+          <td style="font-size:.8rem">${dashIcon} ${u.dashboard_type}</td>
+          <td>${bar(cpuPct, 'var(--accent)')}</td>
+          <td>${bar(memPct, 'var(--green)')}</td>
+          <td>${bar(diskPct, 'var(--yellow)')} <span style="font-size:.72rem;color:var(--muted)">${u.disk_used_gb}/${u.disk_quota_gb}G</span></td>
+        </tr>`;
+      }).join('');
+    } catch(e) {
+      // Ressourcen-Fehler nicht kritisch — Proxmox evtl. nicht erreichbar
+    }
+  }
+
+  /* ── App-Anfragen laden ─────────────────────────────────────── */
+  async function loadRequests() {
+    try {
+      const data = await apiFetch('/admin/apps/requests');
+      const count = data.count || 0;
+      document.getElementById('requestCount').textContent = count;
+      const empty = document.getElementById('requestsEmpty');
+      const table = document.getElementById('requestsTable');
+      if (!count) {
+        empty.style.display = ''; table.style.display = 'none'; return;
+      }
+      empty.style.display = 'none'; table.style.display = '';
+      document.getElementById('requestsBody').innerHTML = data.requests.map(r => {
+        const age = new Date(r.requested_at).toLocaleString('de-DE');
+        return `<tr>
+          <td><span class="user-name">${esc(r.username)}</span></td>
+          <td style="font-family:monospace;font-size:.85rem">${esc(r.app_id)}</td>
+          <td style="font-size:.8rem;color:var(--muted)">${age}</td>
+          <td>
+            <div class="row-actions" style="justify-content:flex-end">
+              <button class="btn btn-primary btn-sm" onclick="approveRequest(${r.id})">✓ Approve</button>
+              <button class="btn btn-danger btn-sm" onclick="denyRequest(${r.id})">✗</button>
+            </div>
+          </td>
+        </tr>`;
+      }).join('');
+    } catch(e) { /* ignore */ }
+  }
+
+  async function approveRequest(id) {
+    try {
+      await apiFetch(`/admin/apps/requests/${id}/approve`, { method: 'POST' });
+      toast('App wird installiert', 'ok');
+      await loadRequests();
+    } catch(e) { toast('Fehler: ' + e.message, 'err'); }
+  }
+
+  async function denyRequest(id) {
+    if (!confirm('Anfrage ablehnen?')) return;
+    try {
+      await apiFetch(`/admin/apps/requests/${id}/deny`, { method: 'POST' });
+      toast('Anfrage abgelehnt', 'ok');
+      await loadRequests();
+    } catch(e) { toast('Fehler: ' + e.message, 'err'); }
+  }
+
   /* ── Tabelle rendern ────────────────────────────────────────── */
   function renderUsers() {
     const wrap = document.getElementById('tableWrap');
@@ -396,7 +517,9 @@
         <td>${displayIp
               ? `<span style="font-family:monospace;font-size:.85rem;color:var(--text)">${esc(displayIp)}</span>
                  <a href="${esc(displayUrl)}" target="_blank"
-                    style="color:var(--muted);font-size:.75rem;margin-left:6px" title="Im Browser öffnen">↗</a>`
+                    style="color:var(--muted);font-size:.75rem;margin-left:6px" title="Dashboard öffnen">↗</a>
+                 <a href="${esc(displayUrl)}/#/app-store" target="_blank"
+                    style="color:var(--muted);font-size:.75rem;margin-left:4px" title="App-Store öffnen">🛒</a>`
               : '<span style="color:var(--muted);font-size:.85rem">—</span>'
             }</td>
         <td style="font-size:.85rem;font-family:monospace;color:var(--muted)">${esc(u.subnet)}</td>
@@ -474,6 +597,7 @@
     const openUrl = u.local_url || u.casaos_url;
     const smb = u.smb_shares || {};
     const vpn = u.vpn || {};
+    const oidc = u.oidc || null;
     const smbUri = smb.password && ip !== '—'
       ? `smb://casaos:${smb.password}@${ip}/files`
       : null;
@@ -484,7 +608,8 @@
         <label>Lok. Adresse</label>
         <div class="key-val">${esc(ip)}</div>
         ${ip !== '—' ? `<button class="btn btn-ghost btn-sm" onclick="copy(${JSON.stringify(ip)}, this)">📋</button>
-        <a href="${esc(openUrl)}" target="_blank" class="btn btn-ghost btn-sm" style="text-decoration:none">↗</a>` : ''}
+        <a href="${esc(openUrl)}" target="_blank" class="btn btn-ghost btn-sm" style="text-decoration:none" title="Dashboard">↗</a>
+        <a href="${esc(openUrl)}/#/app-store" target="_blank" class="btn btn-ghost btn-sm" style="text-decoration:none" title="App-Store">🛒</a>` : ''}
       </div>
       <div class="api-key-row">
         <label>API-Key</label>
@@ -551,7 +676,7 @@
 
         ${openUrl ? `
         <div class="qr-card">
-          <h3>🏠 CasaOS Dashboard</h3>
+          <h3>${u.dashboard_type === 'ugos' ? '🟠 UG-OS Dashboard' : '🏠 CasaOS Dashboard'}</h3>
           <div class="qr-inner">
             <div class="qr-img-wrap" id="qr-casaos-${u.user_id}"></div>
             <div class="qr-info">
@@ -563,10 +688,39 @@
                 <a class="link-btn" href="${esc(openUrl)}" target="_blank">
                   Im Browser öffnen →
                 </a>
+                <a class="link-btn" href="${esc(openUrl)}/#/app-store" target="_blank"
+                   style="margin-top:6px">
+                  App-Store öffnen →
+                </a>
               </div>
               <div style="margin-top:8px;font-size:.72rem;color:var(--muted)">
                 QR scannen → Dashboard im Browser öffnen
               </div>
+            </div>
+          </div>
+        </div>` : ''}
+
+        ${oidc ? `
+        <div class="qr-card" style="grid-column:1/-1">
+          <h3>🔐 OIDC/SSO (Authentik)</h3>
+          <div class="qr-info">
+            <div class="info-row">
+              <label>Issuer</label>
+              <span class="info-val">${esc(oidc.issuer_url || '')}</span>
+              <button class="btn btn-ghost btn-sm" onclick="copy(${JSON.stringify(oidc.issuer_url || '')}, this)">📋</button>
+            </div>
+            <div class="info-row">
+              <label>Client ID</label>
+              <span class="info-val" style="font-family:monospace">${esc(oidc.client_id || '')}</span>
+              <button class="btn btn-ghost btn-sm" onclick="copy(${JSON.stringify(oidc.client_id || '')}, this)">📋</button>
+            </div>
+            <div class="info-row">
+              <label>Secret</label>
+              <span class="info-val" style="font-family:monospace">${esc(oidc.client_secret || '')}</span>
+              <button class="btn btn-ghost btn-sm" onclick="copy(${JSON.stringify(oidc.client_secret || '')}, this)">📋</button>
+            </div>
+            <div style="margin-top:8px;font-size:.72rem;color:var(--muted)">
+              ${esc(oidc.hint || 'In UGOS: Einstellungen → Authentifizierung → OIDC/OAuth2 eintragen')}
             </div>
           </div>
         </div>` : ''}

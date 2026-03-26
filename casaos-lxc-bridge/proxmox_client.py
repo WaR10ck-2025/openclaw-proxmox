@@ -233,6 +233,49 @@ class ProxmoxClient:
         if result.returncode != 0:
             raise RuntimeError(f"pct exec failed (SSH): {result.stderr}")
 
+    def exec_in_vm(self, vm_id: int, command: str, timeout: int = 60) -> str:
+        """
+        Führt Shell-Befehl in einer QEMU-VM via QEMU Guest Agent aus.
+        Benötigt: qemu-guest-agent im VM (UGOS/Debian installiert es automatisch).
+        Gibt stdout zurück.
+        """
+        import base64
+        cmd_b64 = base64.b64encode(command.encode()).decode()
+        # --sync: wartet auf Abschluss + gibt Ausgabe zurück (Proxmox 8+)
+        remote = (
+            f"qm guest exec {vm_id} --sync -- bash -c "
+            f"\"echo {cmd_b64} | base64 -d | bash\" 2>&1 || true"
+        )
+        result = self._ssh_run(remote, timeout=timeout + 30)
+        if result.returncode != 0:
+            raise RuntimeError(f"qm guest exec VM {vm_id} fehlgeschlagen: {result.stderr}")
+        return result.stdout
+
+    def wait_for_vm_ready(self, vm_id: int, timeout: int = 300) -> None:
+        """
+        Wartet bis VM läuft UND QEMU Guest Agent antwortet.
+        Polls get_vm_status() + prüft ob guest exec möglich ist.
+        """
+        import time
+        # Schritt 1: Warten bis VM status=running
+        for _ in range(timeout):
+            if self.get_vm_status(vm_id) == "running":
+                break
+            time.sleep(1)
+
+        # Schritt 2: Warten bis Guest Agent antwortet (max 3 Minuten)
+        for _ in range(180):
+            try:
+                result = self._ssh_run(
+                    f"qm guest exec {vm_id} --sync -- echo ok 2>/dev/null"
+                )
+                if result.returncode == 0 and "ok" in result.stdout:
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+        raise TimeoutError(f"VM {vm_id}: QEMU Guest Agent nicht erreichbar nach {timeout}s")
+
     def push_file_to_lxc(self, lxc_id: int, content: str, remote_path: str) -> None:
         """Überträgt Datei-Inhalt in den LXC via pct push (Shell-sicher via base64)."""
         import base64
@@ -242,3 +285,171 @@ class ProxmoxClient:
         result = self._ssh_run(remote)
         if result.returncode != 0:
             raise RuntimeError(f"pct push failed (SSH): {result.stderr}")
+
+    # ─── VM (QEMU/KVM) Methoden ─────────────────────────────────────────────
+
+    UGOS_TEMPLATE_ID = int(os.getenv("UGOS_TEMPLATE_ID", "9002"))
+
+    def clone_vm_for_user(
+        self,
+        new_id: int,
+        hostname: str,
+        bridge: str,
+        storage: str | None = None,
+    ) -> None:
+        """
+        Klont die UGOS-Template-VM (Standard: 9002) als Full-Clone für einen User.
+        Setzt VirtIO-NIC auf User-Bridge. IP wird nach erstem Boot in UGOS gesetzt.
+        """
+        vm_storage = storage or LXC_STORAGE
+        result = self._request(
+            "POST",
+            f"/nodes/{PROXMOX_NODE}/qemu/{self.UGOS_TEMPLATE_ID}/clone",
+            {
+                "newid": new_id,
+                "name": hostname,
+                "full": 1,
+                "storage": vm_storage,
+            },
+        )
+        upid = result.get("data", "")
+        if upid:
+            self._wait_for_task(upid, timeout=300)  # Full-Clone kann länger dauern
+        self._request("PUT", f"/nodes/{PROXMOX_NODE}/qemu/{new_id}/config", {
+            "net0": f"virtio,bridge={bridge}",
+            "name": hostname,
+        })
+
+    def start_vm(self, vm_id: int) -> None:
+        self._request("POST", f"/nodes/{PROXMOX_NODE}/qemu/{vm_id}/status/start")
+
+    def stop_vm(self, vm_id: int) -> None:
+        self._request("POST", f"/nodes/{PROXMOX_NODE}/qemu/{vm_id}/status/stop")
+
+    def destroy_vm(self, vm_id: int) -> None:
+        self._request("DELETE", f"/nodes/{PROXMOX_NODE}/qemu/{vm_id}?purge=1")
+
+    def get_vm_status(self, vm_id: int) -> str:
+        result = self._request("GET", f"/nodes/{PROXMOX_NODE}/qemu/{vm_id}/status/current")
+        return result.get("data", {}).get("status", "unknown")
+
+    def get_vm_resources(self, vm_id: int) -> dict:
+        """CPU/RAM-Nutzung einer VM. Gibt leeres Dict wenn VM nicht läuft."""
+        try:
+            result = self._request(
+                "GET", f"/nodes/{PROXMOX_NODE}/qemu/{vm_id}/status/current"
+            )
+            data = result.get("data", {})
+            return {
+                "cpu_percent": round(data.get("cpu", 0) * 100, 1),
+                "mem_used_bytes": data.get("mem", 0),
+                "mem_total_bytes": data.get("maxmem", 0),
+                "type": "vm",
+            }
+        except Exception:
+            return {}
+
+    def get_lxc_resources(self, lxc_id: int) -> dict:
+        """CPU/RAM-Nutzung eines LXC. Gibt leeres Dict wenn LXC nicht läuft."""
+        try:
+            result = self._request(
+                "GET", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}/status/current"
+            )
+            data = result.get("data", {})
+            return {
+                "cpu_percent": round(data.get("cpu", 0) * 100, 1),
+                "mem_used_bytes": data.get("mem", 0),
+                "mem_total_bytes": data.get("maxmem", 0),
+                "type": "lxc",
+            }
+        except Exception:
+            return {}
+
+    def set_vm_resources(self, vm_id: int, cores: int, memory_mb: int) -> None:
+        """Setzt CPU-Kerne und RAM-Limit für eine VM."""
+        self._request("PUT", f"/nodes/{PROXMOX_NODE}/qemu/{vm_id}/config", {
+            "cores": cores,
+            "memory": memory_mb,
+        })
+
+    def set_lxc_resources(self, lxc_id: int, cores: int, memory_mb: int) -> None:
+        """Setzt CPU-Kerne und RAM-Limit für einen LXC."""
+        self._request("PUT", f"/nodes/{PROXMOX_NODE}/lxc/{lxc_id}/config", {
+            "cores": cores,
+            "memory": memory_mb,
+        })
+
+    # ─── Proxmox Resource Pools + User-ACLs ─────────────────────────────────
+
+    def create_resource_pool(self, pool_name: str, comment: str = "") -> None:
+        """
+        Legt einen Proxmox Resource Pool an.
+        Idempotent: existierende Pools werden übersprungen.
+        """
+        try:
+            self._request("POST", "/pools", {
+                "poolid": pool_name,
+                "comment": comment,
+            })
+        except RuntimeError as e:
+            if "already exists" in str(e) or "500" in str(e):
+                return  # Pool existiert bereits
+            raise
+
+    def assign_to_pool(self, pool_name: str, vm_ids: list[int]) -> None:
+        """Weist VMs/LXCs einem Resource Pool zu."""
+        if not vm_ids:
+            return
+        vms_str = ";".join(str(v) for v in vm_ids)
+        self._request("PUT", f"/pools/{pool_name}", {"vms": vms_str})
+
+    def create_proxmox_user(self, username: str, realm: str = "authentik") -> None:
+        """
+        Legt einen Proxmox-User an (für Authentik-Realm-Login).
+        Idempotent: existierende User werden übersprungen.
+        """
+        try:
+            self._ssh_run(
+                f"pveum useradd '{username}@{realm}' 2>/dev/null || true"
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Proxmox create_user fehlgeschlagen (nicht kritisch): {e}"
+            )
+
+    def set_user_pool_acl(
+        self,
+        username: str,
+        pool_name: str,
+        role: str = "PVEVMUser",
+        realm: str = "authentik",
+    ) -> None:
+        """
+        Setzt ACL für einen User auf seinen Resource Pool.
+        Ermöglicht User-Zugriff auf eigene VMs/LXCs via Proxmox-UI.
+        """
+        try:
+            self._ssh_run(
+                f"pveum aclmod /pool/{pool_name} "
+                f"--users '{username}@{realm}' --roles {role}"
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Proxmox set_acl fehlgeschlagen (nicht kritisch): {e}"
+            )
+
+    def delete_proxmox_user(self, username: str, realm: str = "authentik") -> None:
+        """Entfernt Proxmox-User."""
+        try:
+            self._ssh_run(f"pveum userdel '{username}@{realm}' 2>/dev/null || true")
+        except Exception:
+            pass
+
+    def delete_resource_pool(self, pool_name: str) -> None:
+        """Entfernt Proxmox Resource Pool."""
+        try:
+            self._request("DELETE", f"/pools/{pool_name}")
+        except Exception:
+            pass

@@ -27,9 +27,17 @@ import secrets
 import logging
 from proxmox_client import ProxmoxClient
 from network_manager import create_bridge, destroy_bridge, get_user_network, get_user_casaos_ip, get_user_mgmt_ip
-from zfs_manager import create_user_dataset, mount_dataset_in_lxc, destroy_user_dataset
+from zfs_manager import (
+    create_user_dataset,
+    mount_dataset_in_lxc,
+    setup_nfs_export,
+    mount_nfs_in_vm,
+    destroy_user_dataset,
+)
 from auth import generate_api_key
 from lxc_manager import _get_db
+import authentik_client
+import portainer_client
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,9 @@ HEADSCALE_URL = os.getenv("HEADSCALE_URL", "http://192.168.10.115:8080")
 TAILSCALE_ENABLED = os.getenv("TAILSCALE_ENABLED", "true").lower() == "true"
 BRIDGE_URL = os.getenv("BRIDGE_URL", "http://192.168.10.141:8200")
 
+# "casaos" = CasaOS-LXC (Template 9001) | "ugos" = UGOS-VM (Template 9002)
+USER_DASHBOARD = os.getenv("USER_DASHBOARD", "casaos")
+
 
 def _set_step(conn, user_id: int, step: str) -> None:
     conn.execute("UPDATE users SET provisioning_step=? WHERE user_id=?", (step, user_id))
@@ -46,7 +57,8 @@ def _set_step(conn, user_id: int, step: str) -> None:
     logger.info(f"User {user_id}: {step}")
 
 
-def provision_user(username: str, quota: str = "100G") -> dict:
+def provision_user(username: str, quota: str = "100G",
+                   storage_tier: str = "premium") -> dict:
     """
     Legt einen neuen User an und provisioniert alle Ressourcen.
     Gibt User-Record als Dict zurück (inkl. api_key).
@@ -102,74 +114,68 @@ def provision_user(username: str, quota: str = "100G") -> dict:
             conn.execute("UPDATE users SET zfs_dataset=? WHERE user_id=?", (zfs_dataset, user_id))
             conn.commit()
 
-        # Schritt 4: CasaOS-LXC aus Template klonen
-        _set_step(conn, user_id, "cloning_casaos_lxc")
-        hostname = f"casaos-{username}"
-        proxmox.clone_template_for_user(casaos_lxc_id, hostname, casaos_ip, bridge, gateway)
-        conn.execute("UPDATE users SET casaos_lxc_id=? WHERE user_id=?", (casaos_lxc_id, user_id))
-        conn.commit()
+        # Schritt 4–10: UGOS-VM oder CasaOS-LXC (komplett unterschiedliche Pfade)
+        _default_storage = os.getenv("PROXMOX_STORAGE", "local-lvm")
+        storage = os.getenv(f"STORAGE_TIER_{storage_tier.upper()}", _default_storage)
 
-        # cgroup2: Kernelzugriff auf physische Blockgeräte verweigern
-        # Major 8 = sd* (SATA/SCSI), 259 = nvme* (NVMe block), 65 = erweiterter SCSI-Bereich
-        proxmox._ssh_run(
-            f"printf 'lxc.cgroup2.devices.deny: b 8:* rwm\\n"
-            f"lxc.cgroup2.devices.deny: b 259:* rwm\\n"
-            f"lxc.cgroup2.devices.deny: b 65:* rwm\\n' "
-            f">> /etc/pve/lxc/{casaos_lxc_id}.conf"
-        )
-
-        # Schritt 5: ZFS-Datasets im LXC mounten (vor dem Start!)
-        _set_step(conn, user_id, "mounting_zfs_datasets")
-        mount_dataset_in_lxc(username, casaos_lxc_id, proxmox)
-
-        # Schritt 6: LXC starten + warten bis bereit (via pct exec — kein direkter TCP-Connect)
-        _set_step(conn, user_id, "starting_casaos_lxc")
-        proxmox.start_lxc(casaos_lxc_id)
-        proxmox.wait_for_lxc_ready(casaos_lxc_id, timeout=120)
-
-        # OpenClaw App-Store in User-CasaOS registrieren
-        # Retry-Loop: CasaOS-Dienste brauchen etwas Zeit nach dem Start
-        try:
-            proxmox.exec_in_lxc(casaos_lxc_id,
-                f"for i in $(seq 1 12); do "
-                f"  casaos-cli app-management register app-store {BRIDGE_URL}/casaos-store.zip "
-                f"  2>/dev/null && break || sleep 5; "
-                f"done"
+        if USER_DASHBOARD == "ugos":
+            casaos_url, tailscale_auth_key = _provision_ugos_vm(
+                conn, user_id, username, casaos_lxc_id,
+                bridge, gateway, subnet, storage, smb_password, api_key, storage_tier, proxmox,
             )
-        except Exception as e:
-            logger.warning(f"App-Store-Registrierung fehlgeschlagen (nicht kritisch): {e}")
+        else:
+            casaos_url, tailscale_auth_key = _provision_casaos_lxc(
+                conn, user_id, username, casaos_lxc_id,
+                casaos_ip, bridge, gateway, storage, smb_password, api_key, storage_tier, proxmox,
+            )
 
-        # Schritt 7: Bridge-Env in LXC deployen (docker compose up)
-        _set_step(conn, user_id, "deploying_bridge_env")
-        _deploy_bridge_env_in_lxc(proxmox, casaos_lxc_id, user_id, username, api_key)
-
-        casaos_url = f"http://{casaos_ip}"
         conn.execute("UPDATE users SET casaos_url=? WHERE user_id=?", (casaos_url, user_id))
         conn.commit()
 
-        # Schritt 8+9: Headscale/Tailscale (optional)
-        tailscale_auth_key = ""
-        if TAILSCALE_ENABLED:
-            _set_step(conn, user_id, "setting_up_headscale")
-            try:
-                tailscale_auth_key = _setup_headscale_namespace(proxmox, username)
-                conn.execute(
-                    "UPDATE users SET tailscale_auth_key=?, headscale_namespace=? WHERE user_id=?",
-                    (tailscale_auth_key, username, user_id)
-                )
-                conn.commit()
-
-                _set_step(conn, user_id, "installing_tailscale")
-                _install_tailscale_in_lxc(proxmox, casaos_lxc_id, tailscale_auth_key)
-            except Exception as e:
-                logger.warning(f"Tailscale-Setup fehlgeschlagen (nicht kritisch): {e}")
-
-        # Schritt 10: SMB-Passwort setzen
-        _set_step(conn, user_id, "configuring_smb")
+        # Schritt 11: Authentik SSO-User anlegen (opt-in via AUTHENTIK_TOKEN)
+        _set_step(conn, user_id, "creating_sso_user")
         try:
-            _configure_smb_shares(proxmox, casaos_lxc_id, smb_password)
+            authentik_pk = authentik_client.create_user(username)
+            # UGOS: OIDC-Application für SSO-Login
+            if USER_DASHBOARD == "ugos":
+                ugos_mgmt_ip = get_user_mgmt_ip(user_id)
+                oidc_info = authentik_client.create_ugos_oidc_app(username, ugos_mgmt_ip)
+                if oidc_info:
+                    conn.execute(
+                        "UPDATE users SET ugos_oidc_client_id=?, ugos_oidc_client_secret=?, "
+                        "ugos_oidc_issuer=? WHERE user_id=?",
+                        (oidc_info.get("client_id", ""),
+                         oidc_info.get("client_secret", ""),
+                         oidc_info.get("issuer_url", ""),
+                         user_id)
+                    )
+            # Proxmox-User + ACL anlegen (Authentik-Realm)
+            pool_name = f"pool-u{user_id}"
+            proxmox.create_resource_pool(pool_name, comment=f"User {username}")
+            proxmox.assign_to_pool(pool_name, [casaos_lxc_id])
+            proxmox.create_proxmox_user(username)
+            proxmox.set_user_pool_acl(username, pool_name)
+            conn.execute(
+                "UPDATE users SET authentik_user_pk=? WHERE user_id=?",
+                (authentik_pk, user_id)
+            )
+            conn.commit()
         except Exception as e:
-            logger.warning(f"SMB-Konfiguration fehlgeschlagen (nicht kritisch): {e}")
+            logger.warning(f"SSO/Proxmox-User-Setup fehlgeschlagen (nicht kritisch): {e}")
+
+        # Schritt 12: Portainer-Team + User anlegen (opt-in via PORTAINER_ADMIN_PASS)
+        _set_step(conn, user_id, "creating_portainer_team")
+        try:
+            team_id = portainer_client.create_team(f"user-{username}")
+            portainer_pwd = secrets.token_urlsafe(16)
+            portainer_client.create_user(username, portainer_pwd, team_id)
+            conn.execute(
+                "UPDATE users SET portainer_team_id=? WHERE user_id=?",
+                (team_id, user_id)
+            )
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Portainer-Setup fehlgeschlagen (nicht kritisch): {e}")
 
         # Fertig
         conn.execute(
@@ -205,6 +211,30 @@ def deprovision_user(user_id: int) -> None:
     proxmox = ProxmoxClient()
     casaos_lxc_id = user["casaos_lxc_id"]
 
+    dashboard_type = user["dashboard_type"] if "dashboard_type" in user.keys() else "casaos"
+
+    # Authentik-User + OIDC App entfernen
+    try:
+        authentik_client.delete_user(user["username"])
+        if dashboard_type == "ugos":
+            authentik_client.delete_ugos_oidc_app(user["username"])
+    except Exception as e:
+        logger.warning(f"Authentik delete_user fehlgeschlagen: {e}")
+
+    # Portainer-Team + User entfernen
+    try:
+        portainer_client.delete_user(user["username"])
+        portainer_client.delete_team(f"user-{user['username']}")
+    except Exception as e:
+        logger.warning(f"Portainer delete fehlgeschlagen: {e}")
+
+    # Proxmox-User + Resource Pool entfernen
+    try:
+        proxmox.delete_proxmox_user(user["username"])
+        proxmox.delete_resource_pool(f"pool-u{user_id}")
+    except Exception as e:
+        logger.warning(f"Proxmox User/Pool delete fehlgeschlagen: {e}")
+
     # Headscale-Namespace entfernen
     namespace = user["headscale_namespace"]
     if namespace:
@@ -231,16 +261,22 @@ def deprovision_user(user_id: int) -> None:
     conn.execute("DELETE FROM apps WHERE user_id=?", (user_id,))
     conn.commit()
 
-    # CasaOS-LXC stoppen + zerstören
+    # Dashboard-VM/LXC stoppen + zerstören
     if casaos_lxc_id:
         try:
-            proxmox.stop_lxc(casaos_lxc_id)
+            if dashboard_type == "ugos":
+                proxmox.stop_vm(casaos_lxc_id)
+            else:
+                proxmox.stop_lxc(casaos_lxc_id)
         except Exception:
             pass
         try:
-            proxmox.destroy_lxc(casaos_lxc_id)
+            if dashboard_type == "ugos":
+                proxmox.destroy_vm(casaos_lxc_id)
+            else:
+                proxmox.destroy_lxc(casaos_lxc_id)
         except Exception as e:
-            logger.warning(f"CasaOS-LXC {casaos_lxc_id} destroy fehlgeschlagen: {e}")
+            logger.warning(f"Dashboard {casaos_lxc_id} destroy fehlgeschlagen: {e}")
 
     # ZFS-Dataset entfernen
     try:
@@ -286,6 +322,160 @@ def get_user_quota(user_id: int) -> dict:
 
 
 # ─── Interne Hilfsfunktionen ─────────────────────────────────────────────────
+
+def _provision_ugos_vm(
+    conn, user_id, username, vm_id,
+    bridge, gateway, subnet, storage, smb_password, api_key, storage_tier, proxmox,
+) -> tuple[str, str]:
+    """
+    UGOS-VM Provisioning-Pfad (KVM/QEMU).
+    Gibt (casaos_url, tailscale_auth_key) zurück.
+
+    Unterschiede zu CasaOS-LXC:
+      - clone_vm_for_user statt clone_template_for_user
+      - ZFS via NFS statt pct set bindmount
+      - start_vm + wait_for_vm_ready statt start_lxc
+      - Kein App-Store / Bridge-Env (UGOS hat eigenes Dashboard)
+      - QEMU Guest Agent für SSH-lose Exec-Befehle
+    """
+    _set_step(conn, user_id, "cloning_ugos_vm")
+    hostname = f"ugos-{username}"
+    proxmox.clone_vm_for_user(vm_id, hostname, bridge, storage)
+    conn.execute(
+        "UPDATE users SET casaos_lxc_id=?, dashboard_type=?, storage_tier=? WHERE user_id=?",
+        (vm_id, "ugos", storage_tier, user_id)
+    )
+    conn.commit()
+
+    # Schritt 5: ZFS via NFS exportieren (statt LXC-Bindmount)
+    _set_step(conn, user_id, "mounting_zfs_datasets")
+    setup_nfs_export(username, subnet, proxmox)
+
+    # Schritt 6: VM starten + auf Guest Agent warten
+    _set_step(conn, user_id, "starting_casaos_lxc")
+    proxmox.start_vm(vm_id)
+    proxmox.wait_for_vm_ready(vm_id, timeout=300)
+
+    # NFS-Shares in VM mounten (via QEMU Guest Agent)
+    try:
+        nfs_host = gateway   # Proxmox-Bridge-IP = 10.U.0.1
+        mount_nfs_in_vm(username, vm_id, nfs_host, proxmox)
+    except Exception as e:
+        logger.warning(f"NFS-Mount in UGOS-VM fehlgeschlagen (nicht kritisch): {e}")
+
+    # Kein App-Store / Bridge-Env für UGOS (hat eigenes Dashboard)
+
+    # Headscale/Tailscale (optional, via Guest Agent)
+    tailscale_auth_key = ""
+    if TAILSCALE_ENABLED:
+        _set_step(conn, user_id, "setting_up_headscale")
+        try:
+            tailscale_auth_key = _setup_headscale_namespace(proxmox, username)
+            conn.execute(
+                "UPDATE users SET tailscale_auth_key=?, headscale_namespace=? WHERE user_id=?",
+                (tailscale_auth_key, username, user_id)
+            )
+            conn.commit()
+            _set_step(conn, user_id, "installing_tailscale")
+            _install_tailscale_in_vm(proxmox, vm_id, tailscale_auth_key)
+        except Exception as e:
+            logger.warning(f"Tailscale-Setup (UGOS) fehlgeschlagen (nicht kritisch): {e}")
+
+    # UGOS hat eingebautes Samba → kein separates Passwort nötig
+    # Management-URL (lokale Erreichbarkeit via DNAT 192.168.10.{149+U})
+    mgmt_ip = get_user_mgmt_ip(user_id)
+    casaos_url = f"http://{mgmt_ip}"
+    return casaos_url, tailscale_auth_key
+
+
+def _provision_casaos_lxc(
+    conn, user_id, username, lxc_id,
+    casaos_ip, bridge, gateway, storage, smb_password, api_key, storage_tier, proxmox,
+) -> tuple[str, str]:
+    """
+    CasaOS-LXC Provisioning-Pfad (ursprünglicher Pfad).
+    Gibt (casaos_url, tailscale_auth_key) zurück.
+    """
+    _set_step(conn, user_id, "cloning_casaos_lxc")
+    hostname = f"casaos-{username}"
+    proxmox.clone_template_for_user(lxc_id, hostname, casaos_ip, bridge, gateway)
+    conn.execute(
+        "UPDATE users SET casaos_lxc_id=?, dashboard_type=?, storage_tier=? WHERE user_id=?",
+        (lxc_id, "casaos", storage_tier, user_id)
+    )
+    conn.commit()
+
+    # cgroup2: Kernelzugriff auf physische Blockgeräte verweigern (LXC only)
+    proxmox._ssh_run(
+        f"printf 'lxc.cgroup2.devices.deny: b 8:* rwm\\n"
+        f"lxc.cgroup2.devices.deny: b 259:* rwm\\n"
+        f"lxc.cgroup2.devices.deny: b 65:* rwm\\n' "
+        f">> /etc/pve/lxc/{lxc_id}.conf"
+    )
+
+    # Schritt 5: ZFS-Datasets im LXC mounten (vor dem Start!)
+    _set_step(conn, user_id, "mounting_zfs_datasets")
+    mount_dataset_in_lxc(username, lxc_id, proxmox)
+
+    # Schritt 6: LXC starten + warten bis bereit
+    _set_step(conn, user_id, "starting_casaos_lxc")
+    proxmox.start_lxc(lxc_id)
+    proxmox.wait_for_lxc_ready(lxc_id, timeout=120)
+
+    # OpenClaw App-Store in User-CasaOS registrieren
+    try:
+        proxmox.exec_in_lxc(lxc_id,
+            f"for i in $(seq 1 12); do "
+            f"  casaos-cli app-management register app-store {BRIDGE_URL}/casaos-store.zip "
+            f"  2>/dev/null && break || sleep 5; "
+            f"done"
+        )
+    except Exception as e:
+        logger.warning(f"App-Store-Registrierung fehlgeschlagen (nicht kritisch): {e}")
+
+    # Schritt 7: Bridge-Env in LXC deployen (docker compose up)
+    _set_step(conn, user_id, "deploying_bridge_env")
+    _deploy_bridge_env_in_lxc(proxmox, lxc_id, user_id, username, api_key)
+
+    # Schritt 8+9: Headscale/Tailscale
+    tailscale_auth_key = ""
+    if TAILSCALE_ENABLED:
+        _set_step(conn, user_id, "setting_up_headscale")
+        try:
+            tailscale_auth_key = _setup_headscale_namespace(proxmox, username)
+            conn.execute(
+                "UPDATE users SET tailscale_auth_key=?, headscale_namespace=? WHERE user_id=?",
+                (tailscale_auth_key, username, user_id)
+            )
+            conn.commit()
+            _set_step(conn, user_id, "installing_tailscale")
+            _install_tailscale_in_lxc(proxmox, lxc_id, tailscale_auth_key)
+        except Exception as e:
+            logger.warning(f"Tailscale-Setup fehlgeschlagen (nicht kritisch): {e}")
+
+    # Schritt 10: SMB-Passwort setzen
+    _set_step(conn, user_id, "configuring_smb")
+    try:
+        _configure_smb_shares(proxmox, lxc_id, smb_password)
+    except Exception as e:
+        logger.warning(f"SMB-Konfiguration fehlgeschlagen (nicht kritisch): {e}")
+
+    casaos_url = f"http://{casaos_ip}"
+    return casaos_url, tailscale_auth_key
+
+
+def _install_tailscale_in_vm(proxmox: ProxmoxClient, vm_id: int, auth_key: str) -> None:
+    """Installiert Tailscale in einer UGOS-VM via QEMU Guest Agent."""
+    proxmox.exec_in_vm(vm_id,
+        "which tailscale 2>/dev/null || curl -fsSL https://tailscale.com/install.sh | sh"
+    )
+    proxmox.exec_in_vm(vm_id, "systemctl restart tailscaled 2>/dev/null || true")
+    import time; time.sleep(5)
+    proxmox.exec_in_vm(vm_id,
+        f"tailscale up --login-server={HEADSCALE_URL} --authkey={auth_key} "
+        "--accept-routes --accept-dns=false"
+    )
+
 
 def _deploy_bridge_env_in_lxc(
     proxmox: ProxmoxClient,
@@ -390,6 +580,7 @@ def _configure_smb_shares(proxmox: ProxmoxClient, lxc_id: int, smb_password: str
 
 def _user_to_dict(row) -> dict:
     """Konvertiert SQLite-Row zu Dict (api_key immer enthalten für Admin-Response)."""
+    dashboard_type = row["dashboard_type"] if "dashboard_type" in row.keys() else "casaos"
     return {
         "user_id": row["user_id"],
         "username": row["username"],
@@ -407,8 +598,12 @@ def _user_to_dict(row) -> dict:
         "headscale_namespace": row["headscale_namespace"],
         "status": row["status"],
         "provisioning_step": row["provisioning_step"],
+        "dashboard_type": dashboard_type,
+        "storage_tier": row["storage_tier"] if "storage_tier" in row.keys() else "premium",
+        "portainer_team_id": row["portainer_team_id"] if "portainer_team_id" in row.keys() else 0,
         "smb_shares": _smb_shares(row),
         "vpn": _vpn_info(row),
+        "oidc": _oidc_info(row),
     }
 
 
@@ -422,6 +617,20 @@ def _smb_shares(row) -> dict | None:
         "appdata": f"\\\\{display_ip}\\appdata",
         "user":    "casaos",
         "password": row["smb_password"],
+    }
+
+
+def _oidc_info(row) -> dict | None:
+    """OIDC-Credentials für UGOS SSO — nur wenn vorhanden."""
+    cols = row.keys() if hasattr(row, "keys") else []
+    client_id = row["ugos_oidc_client_id"] if "ugos_oidc_client_id" in cols else ""
+    if not client_id:
+        return None
+    return {
+        "client_id": client_id,
+        "client_secret": row["ugos_oidc_client_secret"] if "ugos_oidc_client_secret" in cols else "",
+        "issuer_url": row["ugos_oidc_issuer"] if "ugos_oidc_issuer" in cols else "",
+        "hint": "UGOS: Einstellungen → Authentifizierung → OIDC/OAuth2",
     }
 
 

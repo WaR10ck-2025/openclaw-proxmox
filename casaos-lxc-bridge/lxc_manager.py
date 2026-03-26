@@ -80,6 +80,33 @@ def _get_db() -> sqlite3.Connection:
     if "casaos_mgmt_ip" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN casaos_mgmt_ip TEXT")
 
+    # --- Migration: dashboard_type + storage_tier + portainer_team_id + OIDC (idempotent) ---
+    for col, default in [
+        ("dashboard_type", "'casaos'"),
+        ("storage_tier", "'premium'"),
+        ("portainer_team_id", "0"),
+        ("authentik_user_pk", "''"),
+        ("ugos_oidc_client_id", "''"),
+        ("ugos_oidc_client_secret", "''"),
+        ("ugos_oidc_issuer", "''"),
+    ]:
+        if col not in ucols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {default}")
+
+    # --- app_requests-Tabelle (Service-Anfragen von Usern) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_requests (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER NOT NULL REFERENCES users(user_id),
+            app_id       TEXT NOT NULL,
+            requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status       TEXT DEFAULT 'pending',
+            reviewed_by  TEXT DEFAULT '',
+            reviewed_at  DATETIME,
+            notes        TEXT DEFAULT ''
+        )
+    """)
+
     conn.commit()
     return conn
 
@@ -283,6 +310,25 @@ def install_for_user(
                 )
             except Exception:
                 pass  # Tailscale ist optional
+
+        # Optional: Portainer Agent installieren + Endpoint registrieren
+        portainer_team_id = int(user.get("portainer_team_id") or 0)
+        if portainer_team_id:
+            try:
+                import portainer_client
+                proxmox.exec_in_lxc(lxc_id,
+                    "docker run -d --name portainer_agent --restart always "
+                    "-v /var/run/docker.sock:/var/run/docker.sock "
+                    "-v /var/lib/docker/volumes:/var/lib/docker/volumes "
+                    f"-p {portainer_client.PORTAINER_AGENT_PORT}:{portainer_client.PORTAINER_AGENT_PORT} "
+                    "portainer/agent:latest 2>/dev/null || true"
+                )
+                portainer_client.register_endpoint(hostname, ip, portainer_team_id)
+            except Exception as pe:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"Portainer Agent für {hostname} fehlgeschlagen (nicht kritisch): {pe}"
+                )
 
         rec.status = "running"
         conn.execute("UPDATE apps SET status='running' WHERE app_id=?", (rec.app_id,))

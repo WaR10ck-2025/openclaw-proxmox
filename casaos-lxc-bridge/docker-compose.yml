@@ -32,6 +32,25 @@ services:
       - HEADSCALE_LXC_IP=${HEADSCALE_LXC_IP:-192.168.10.115}
       - HEADSCALE_PORT=${HEADSCALE_PORT:-8080}
       - TAILSCALE_ENABLED=${TAILSCALE_ENABLED:-true}
+      # UGOS (casaos | ugos)
+      - USER_DASHBOARD=${USER_DASHBOARD:-casaos}
+      - UGOS_TEMPLATE_ID=${UGOS_TEMPLATE_ID:-9002}
+      # Storage Tiers
+      - STORAGE_TIER_PREMIUM=${STORAGE_TIER_PREMIUM:-local-zfs}
+      - STORAGE_TIER_STANDARD=${STORAGE_TIER_STANDARD:-local-lvm}
+      # Authentik SSO (leer = deaktiviert)
+      - AUTHENTIK_URL=${AUTHENTIK_URL:-http://192.168.10.125:9000}
+      - AUTHENTIK_TOKEN=${AUTHENTIK_TOKEN:-}
+      # Portainer (leer = deaktiviert)
+      - PORTAINER_URL=${PORTAINER_URL:-http://192.168.10.130:9000}
+      - PORTAINER_ADMIN_USER=${PORTAINER_ADMIN_USER:-admin}
+      - PORTAINER_ADMIN_PASS=${PORTAINER_ADMIN_PASS:-}
+      # App-Slot-Limit pro User (0 = kein Limit, Anfragen direkt genehmigt)
+      - USER_APP_SLOT_LIMIT=${USER_APP_SLOT_LIMIT:-10}
+      # WebAuthn YubiKey (leer = deaktiviert)
+      - WEBAUTHN_RP_ID=${WEBAUTHN_RP_ID:-localhost}
+      - WEBAUTHN_RP_NAME=${WEBAUTHN_RP_NAME:-OpenClaw Admin}
+      - WEBAUTHN_ENABLED=${WEBAUTHN_ENABLED:-false}
     volumes:
       - bridge-data:/data
       - /root/.ssh/proxmox_key:/app/proxmox_key:ro

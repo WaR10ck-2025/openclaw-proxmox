@@ -78,6 +78,29 @@ if [ ! -f /etc/apt/sources.list.d/pve-no-subscription.list ]; then
 fi
 log "✓ APT Repos konfiguriert"
 
+# ── Schritt 2b: Subscription-Popup deaktivieren ───────────────────────────
+log_section "Subscription-Popup deaktivieren"
+PROXMOX_LIB="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+if [ -f "$PROXMOX_LIB" ]; then
+  PATCHED=0
+  # PVE 7.x Variante
+  if grep -q "data.status !== 'Active'" "$PROXMOX_LIB"; then
+    sed -i.bak "s/data.status !== 'Active'/false/g" "$PROXMOX_LIB"
+    log "✓ Subscription-Popup deaktiviert (PVE 7.x)"
+    PATCHED=1
+  fi
+  # PVE 8/9.x Variante
+  if grep -q "res.data.status.toLowerCase() !== 'active'" "$PROXMOX_LIB"; then
+    sed -i.bak "s/res.data.status.toLowerCase() !== 'active'/false/g" "$PROXMOX_LIB"
+    log "✓ Subscription-Popup deaktiviert (PVE 8/9.x)"
+    PATCHED=1
+  fi
+  [ "$PATCHED" -eq 0 ] && log "✓ proxmoxlib.js bereits gepatcht oder unbekannte PVE-Version"
+  systemctl restart pveproxy 2>/dev/null && log "✓ pveproxy neugestartet" || true
+else
+  log "⚠ proxmoxlib.js nicht gefunden — Popup-Fix übersprungen"
+fi
+
 # ── Schritt 3: Basis-Pakete ───────────────────────────────────────────────
 log_section "Basis-Pakete installieren"
 apt-get update -qq
