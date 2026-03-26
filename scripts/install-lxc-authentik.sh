@@ -13,13 +13,13 @@ set -e
 LXC_ID=125
 LXC_IP=192.168.10.125
 LXC_HOSTNAME=authentik-sso
-LXC_STORAGE=${PROXMOX_STORAGE:-local-lvm}
+LXC_STORAGE=${PROXMOX_STORAGE:-local-zfs}
 LXC_MEMORY=2048
 LXC_CORES=2
 PROXMOX_NODE=${PROXMOX_NODE:-pve}
 
 # Debian 12 Template (ggf. anpassen)
-TEMPLATE="local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE="local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst"
 
 echo "=== Authentik SSO LXC ${LXC_ID} (${LXC_IP}) ==="
 
