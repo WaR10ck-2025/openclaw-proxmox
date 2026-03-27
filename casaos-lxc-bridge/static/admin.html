@@ -332,6 +332,15 @@
       <span>🛡️</span> Mit Authentik anmelden
     </a>
 
+    <!-- YubiKey Login (nur sichtbar wenn WEBAUTHN_ENABLED=true) -->
+    <div id="yubiLoginBlock" style="display:none">
+      <div class="login-divider">oder YubiKey verwenden</div>
+      <button class="btn-oidc" id="yubiLoginBtn" onclick="yubiAuthenticate()" style="background:linear-gradient(135deg,#16a34a,#15803d)">
+        <span>🔑</span> Mit YubiKey anmelden
+      </button>
+      <div id="yubiLoginMsg" style="font-size:0.8rem;color:var(--muted);margin-top:8px;min-height:18px"></div>
+    </div>
+
     <div class="login-divider">oder API-Key verwenden</div>
 
     <div class="login-key-section">
@@ -390,6 +399,22 @@
 
   <div id="tableWrap">
     <div class="empty"><div class="big">👥</div>Keine User angelegt.</div>
+  </div>
+
+  <!-- ── YubiKey-Verwaltung ─────────────────────────────────── -->
+  <div id="yubiSection" style="display:none">
+    <div class="section-header" style="margin-top:28px">
+      <h2>YubiKey / WebAuthn</h2>
+    </div>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:12px">
+      <p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">Registriere einen YubiKey als zusätzliche Login-Methode für das Admin-Dashboard.</p>
+      <button class="btn btn-primary btn-sm" id="yubiRegisterBtn" onclick="yubiRegister()">+ YubiKey registrieren</button>
+      <span id="yubiRegisterMsg" style="font-size:0.8rem;color:var(--muted);margin-left:12px"></span>
+      <table class="user-table" style="margin-top:14px">
+        <thead><tr><th>#</th><th>Registriert am</th><th></th></tr></thead>
+        <tbody id="yubiKeysList"><tr><td colspan="3" style="color:var(--muted);text-align:center">Wird geladen…</td></tr></tbody>
+      </table>
+    </div>
   </div>
 </main>
 
@@ -1005,22 +1030,123 @@
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
+  /* ── WebAuthn / YubiKey ─────────────────────────────────────── */
+  function b64uEncode(buf) {
+    return btoa(String.fromCharCode(...new Uint8Array(buf)))
+      .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+  function b64uDecode(s) {
+    s = s.replace(/-/g,'+').replace(/_/g,'/');
+    while (s.length % 4) s += '=';
+    return Uint8Array.from(atob(s), c => c.charCodeAt(0)).buffer;
+  }
+  function prepareOptions(opts) {
+    if (opts.challenge) opts.challenge = b64uDecode(opts.challenge);
+    for (const key of ['allowCredentials','excludeCredentials']) {
+      if (opts[key]) opts[key] = opts[key].map(c => ({ ...c, id: b64uDecode(c.id) }));
+    }
+    if (opts.user?.id) opts.user.id = b64uDecode(opts.user.id);
+    return opts;
+  }
+  function credToJSON(cred) {
+    const resp = cred.response;
+    const obj = { id: cred.id, type: cred.type, rawId: b64uEncode(cred.rawId), response: {} };
+    if (resp.clientDataJSON)    obj.response.clientDataJSON    = b64uEncode(resp.clientDataJSON);
+    if (resp.attestationObject) obj.response.attestationObject = b64uEncode(resp.attestationObject);
+    if (resp.authenticatorData) obj.response.authenticatorData = b64uEncode(resp.authenticatorData);
+    if (resp.signature)         obj.response.signature         = b64uEncode(resp.signature);
+    if (resp.userHandle)        obj.response.userHandle        = b64uEncode(resp.userHandle);
+    return obj;
+  }
+
+  async function yubiAuthenticate() {
+    const btn = document.getElementById('yubiLoginBtn');
+    const msg = document.getElementById('yubiLoginMsg');
+    btn.disabled = true; msg.textContent = 'YubiKey berühren…';
+    try {
+      const r = await fetch('/auth/webauthn/authenticate/begin',
+        { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+      if (!r.ok) { msg.textContent = await r.text(); btn.disabled=false; return; }
+      const { options, handle } = await r.json();
+      prepareOptions(options);
+      const cred = await navigator.credentials.get({ publicKey: options });
+      const r2 = await fetch('/auth/webauthn/authenticate/complete', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ handle, credential: credToJSON(cred) }),
+      });
+      if (!r2.ok) { msg.textContent = 'Fehler: ' + (await r2.json()).detail; btn.disabled=false; return; }
+      location.reload();
+    } catch(e) {
+      msg.textContent = e.name==='NotAllowedError' ? 'Abgebrochen.' : String(e);
+      btn.disabled = false;
+    }
+  }
+
+  async function yubiRegister() {
+    const btn = document.getElementById('yubiRegisterBtn');
+    const msg = document.getElementById('yubiRegisterMsg');
+    btn.disabled = true; msg.textContent = 'YubiKey berühren…';
+    try {
+      const r = await apiFetch('/auth/webauthn/register/begin', { method:'POST' });
+      prepareOptions(r.options);
+      const cred = await navigator.credentials.create({ publicKey: r.options });
+      const r2 = await apiFetch('/auth/webauthn/register/complete', {
+        method:'POST', body: JSON.stringify({ handle: r.handle, credential: credToJSON(cred) }),
+      });
+      msg.textContent = r2.success ? '✓ YubiKey registriert!' : 'Fehler';
+      if (r2.success) loadYubiKeys();
+    } catch(e) {
+      msg.textContent = e.name==='NotAllowedError' ? 'Abgebrochen.' : String(e);
+    }
+    btn.disabled = false;
+  }
+
+  async function loadYubiKeys() {
+    const list = document.getElementById('yubiKeysList');
+    if (!list) return;
+    // Sektion nur einblenden wenn WebAuthn aktiv (API erreichbar)
+    try {
+      const wn = await fetch('/auth/webauthn/enabled');
+      if (wn.ok && (await wn.json()).enabled)
+        document.getElementById('yubiSection').style.display = '';
+    } catch {}
+    try {
+      const data = await apiFetch('/auth/webauthn/credentials');
+      if (!data.credentials?.length) {
+        list.innerHTML = '<tr><td colspan="3" style="color:var(--muted);text-align:center">Kein YubiKey registriert</td></tr>';
+        return;
+      }
+      list.innerHTML = data.credentials.map(c => `
+        <tr>
+          <td>#${c.id}</td>
+          <td style="color:var(--muted);font-size:0.8rem">${(c.created_at||'').split('T')[0]}</td>
+          <td><button class="btn btn-danger btn-sm" onclick="deleteYubiKey(${c.id})">Löschen</button></td>
+        </tr>`).join('');
+    } catch {}
+  }
+
+  async function deleteYubiKey(id) {
+    if (!confirm('YubiKey löschen?')) return;
+    await apiFetch(`/auth/webauthn/credentials/${id}`, { method:'DELETE' });
+    loadYubiKeys();
+  }
+
   /* ── Init ───────────────────────────────────────────────────── */
   (async () => {
+    // WebAuthn-Status → YubiKey-Login-Button einblenden
+    try {
+      const wn = await fetch('/auth/webauthn/enabled');
+      if (wn.ok && (await wn.json()).enabled)
+        document.getElementById('yubiLoginBlock').style.display = '';
+    } catch {}
+
     const oidcOk = await checkOidcSession();
     if (oidcOk) {
-      // OIDC-Session aktiv → direkt laden
-      await loadUsers();
-      loadResources();
-      loadRequests();
+      await loadUsers(); loadResources(); loadRequests(); loadYubiKeys();
     } else if (adminKey) {
-      // API-Key aus sessionStorage → direkt laden
       document.getElementById('keyInput').value = '••••••••';
-      await loadUsers();
-      loadResources();
-      loadRequests();
+      await loadUsers(); loadResources(); loadRequests(); loadYubiKeys();
     } else {
-      // Nicht eingeloggt → Overlay zeigen
       showOverlayIfNeeded();
     }
   })();

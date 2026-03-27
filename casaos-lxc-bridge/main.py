@@ -934,3 +934,257 @@ async def auth_logout(request: Request):
     response = RedirectResponse("/static/admin.html", status_code=302)
     response.delete_cookie("oidc_session")
     return response
+
+
+# ---------------------------------------------------------------------------
+# WebAuthn / YubiKey MFA — Admin-Dashboard
+# ---------------------------------------------------------------------------
+WEBAUTHN_ENABLED = os.getenv("WEBAUTHN_ENABLED", "false").lower() == "true"
+WEBAUTHN_RP_ID   = os.getenv("WEBAUTHN_RP_ID", "localhost")
+WEBAUTHN_RP_NAME = os.getenv("WEBAUTHN_RP_NAME", "OpenClaw Admin")
+
+# In-Memory Challenge-Store (kurzlebig, 5 Minuten)
+_wn_challenges: dict[str, tuple[bytes, float]] = {}   # handle → (challenge, expires)
+
+def _wn_db():
+    """SQLite-Connection für WebAuthn-Credentials (in /data/apps.db)."""
+    from lxc_manager import _get_db
+    conn = _get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS webauthn_credentials (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_handle TEXT    NOT NULL,
+            credential_id BLOB  NOT NULL UNIQUE,
+            public_key  BLOB    NOT NULL,
+            sign_count  INTEGER NOT NULL DEFAULT 0,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+@app.get("/auth/webauthn/enabled")
+async def webauthn_status():
+    """Gibt zurück ob WebAuthn aktiviert ist."""
+    return {"enabled": WEBAUTHN_ENABLED}
+
+
+@app.post("/auth/webauthn/register/begin")
+async def webauthn_register_begin(_: None = Depends(require_admin)):
+    """Startet WebAuthn-Registrierung: gibt PublicKeyCredentialCreationOptions zurück."""
+    if not WEBAUTHN_ENABLED:
+        raise HTTPException(501, detail="WebAuthn nicht aktiviert (WEBAUTHN_ENABLED=false)")
+    try:
+        from fido2.server import Fido2Server
+        from fido2.webauthn import PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity
+        from fido2 import cbor
+        import base64
+
+        rp = PublicKeyCredentialRpEntity(id=WEBAUTHN_RP_ID, name=WEBAUTHN_RP_NAME)
+        server = Fido2Server(rp)
+
+        conn = _wn_db()
+        existing = conn.execute(
+            "SELECT credential_id FROM webauthn_credentials WHERE user_handle='admin'"
+        ).fetchall()
+        existing_creds = [row["credential_id"] for row in existing] if existing else []
+
+        user = PublicKeyCredentialUserEntity(
+            id=b"admin",
+            name="admin",
+            display_name="OpenClaw Admin",
+        )
+        options, state = server.register_begin(
+            user,
+            credentials=existing_creds,
+            user_verification="preferred",
+        )
+
+        import secrets as _sec
+        handle = _sec.token_hex(16)
+        _wn_challenges[handle] = (state, time.time() + 300)
+
+        # options als JSON-serialisierbares Dict aufbereiten
+        opts_dict = options.to_dict() if hasattr(options, "to_dict") else dict(options)
+        return {"options": opts_dict, "handle": handle}
+    except ImportError:
+        raise HTTPException(501, detail="fido2-Bibliothek nicht installiert")
+
+
+@app.post("/auth/webauthn/register/complete")
+async def webauthn_register_complete(
+    body: dict,
+    _: None = Depends(require_admin),
+):
+    """Schließt WebAuthn-Registrierung ab und speichert den Credential."""
+    if not WEBAUTHN_ENABLED:
+        raise HTTPException(501, detail="WebAuthn nicht aktiviert")
+    try:
+        from fido2.server import Fido2Server
+        from fido2.webauthn import (
+            PublicKeyCredentialRpEntity,
+            AuthenticatorAttestationResponse,
+            RegistrationResponse,
+        )
+        import base64
+
+        handle = body.get("handle", "")
+        entry = _wn_challenges.pop(handle, None)
+        if not entry or time.time() > entry[1]:
+            raise HTTPException(400, detail="Challenge abgelaufen oder ungültig")
+        state = entry[0]
+
+        rp = PublicKeyCredentialRpEntity(id=WEBAUTHN_RP_ID, name=WEBAUTHN_RP_NAME)
+        server = Fido2Server(rp)
+
+        credential_data = body.get("credential", {})
+        auth_response = RegistrationResponse.from_dict(credential_data)
+        auth_data = server.register_complete(state, auth_response)
+
+        conn = _wn_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO webauthn_credentials "
+            "(user_handle, credential_id, public_key, sign_count) VALUES (?, ?, ?, ?)",
+            (
+                "admin",
+                bytes(auth_data.credential_id),
+                bytes(auth_data.public_key),
+                auth_data.sign_count,
+            ),
+        )
+        conn.commit()
+        logger.info("WebAuthn: Neuer Credential registriert für 'admin'")
+        return {"success": True}
+    except ImportError:
+        raise HTTPException(501, detail="fido2-Bibliothek nicht installiert")
+    except Exception as e:
+        raise HTTPException(400, detail=f"Registrierung fehlgeschlagen: {e}")
+
+
+@app.post("/auth/webauthn/authenticate/begin")
+async def webauthn_authenticate_begin():
+    """Startet WebAuthn-Authentifizierung: gibt PublicKeyCredentialRequestOptions zurück."""
+    if not WEBAUTHN_ENABLED:
+        raise HTTPException(501, detail="WebAuthn nicht aktiviert")
+    try:
+        from fido2.server import Fido2Server
+        from fido2.webauthn import PublicKeyCredentialRpEntity
+
+        rp = PublicKeyCredentialRpEntity(id=WEBAUTHN_RP_ID, name=WEBAUTHN_RP_NAME)
+        server = Fido2Server(rp)
+
+        conn = _wn_db()
+        creds = conn.execute(
+            "SELECT credential_id, public_key, sign_count FROM webauthn_credentials "
+            "WHERE user_handle='admin'"
+        ).fetchall()
+        if not creds:
+            raise HTTPException(404, detail="Kein YubiKey registriert")
+
+        from fido2.webauthn import AttestedCredentialData
+        credential_list = [
+            AttestedCredentialData.create(
+                row["credential_id"], row["public_key"]
+            ) for row in creds
+        ]
+
+        options, state = server.authenticate_begin(
+            credentials=credential_list,
+            user_verification="preferred",
+        )
+
+        import secrets as _sec
+        handle = _sec.token_hex(16)
+        _wn_challenges[handle] = (state, time.time() + 300)
+
+        opts_dict = options.to_dict() if hasattr(options, "to_dict") else dict(options)
+        return {"options": opts_dict, "handle": handle}
+    except ImportError:
+        raise HTTPException(501, detail="fido2-Bibliothek nicht installiert")
+
+
+@app.post("/auth/webauthn/authenticate/complete")
+async def webauthn_authenticate_complete(body: dict):
+    """Schließt WebAuthn-Authentifizierung ab, setzt Session-Cookie bei Erfolg."""
+    if not WEBAUTHN_ENABLED:
+        raise HTTPException(501, detail="WebAuthn nicht aktiviert")
+    try:
+        from fido2.server import Fido2Server
+        from fido2.webauthn import (
+            PublicKeyCredentialRpEntity,
+            AuthenticationResponse,
+            AttestedCredentialData,
+        )
+
+        handle = body.get("handle", "")
+        entry = _wn_challenges.pop(handle, None)
+        if not entry or time.time() > entry[1]:
+            raise HTTPException(400, detail="Challenge abgelaufen oder ungültig")
+        state = entry[0]
+
+        rp = PublicKeyCredentialRpEntity(id=WEBAUTHN_RP_ID, name=WEBAUTHN_RP_NAME)
+        server = Fido2Server(rp)
+
+        conn = _wn_db()
+        creds = conn.execute(
+            "SELECT id, credential_id, public_key, sign_count FROM webauthn_credentials "
+            "WHERE user_handle='admin'"
+        ).fetchall()
+        credential_list = [
+            AttestedCredentialData.create(row["credential_id"], row["public_key"])
+            for row in creds
+        ]
+
+        credential_data = body.get("credential", {})
+        auth_response = AuthenticationResponse.from_dict(credential_data)
+        auth_data = server.authenticate_complete(state, credential_list, auth_response)
+
+        # sign_count aktualisieren
+        conn.execute(
+            "UPDATE webauthn_credentials SET sign_count=? WHERE credential_id=?",
+            (auth_data.new_sign_count, bytes(auth_data.credential_id)),
+        )
+        conn.commit()
+
+        # Session anlegen
+        from auth import create_oidc_session
+        sid = create_oidc_session("admin", is_admin=True)
+        response = JSONResponse({"success": True})
+        response.set_cookie(
+            "oidc_session", sid,
+            httponly=True, samesite="lax", max_age=8 * 3600,
+        )
+        logger.info("WebAuthn: Admin erfolgreich authentifiziert via YubiKey")
+        return response
+    except ImportError:
+        raise HTTPException(501, detail="fido2-Bibliothek nicht installiert")
+    except Exception as e:
+        raise HTTPException(401, detail=f"Authentifizierung fehlgeschlagen: {e}")
+
+
+@app.get("/auth/webauthn/credentials")
+async def webauthn_list_credentials(_: None = Depends(require_admin)):
+    """Listet registrierte WebAuthn-Credentials."""
+    conn = _wn_db()
+    rows = conn.execute(
+        "SELECT id, user_handle, sign_count, created_at FROM webauthn_credentials "
+        "WHERE user_handle='admin'"
+    ).fetchall()
+    return {
+        "count": len(rows),
+        "credentials": [dict(r) for r in rows],
+    }
+
+
+@app.delete("/auth/webauthn/credentials/{cred_id}")
+async def webauthn_delete_credential(cred_id: int, _: None = Depends(require_admin)):
+    """Löscht einen registrierten WebAuthn-Credential."""
+    conn = _wn_db()
+    result = conn.execute(
+        "DELETE FROM webauthn_credentials WHERE id=? AND user_handle='admin'", (cred_id,)
+    )
+    conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(404, detail="Credential nicht gefunden")
+    return {"success": True, "deleted_id": cred_id}
