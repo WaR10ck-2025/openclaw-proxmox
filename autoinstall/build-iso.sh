@@ -136,10 +136,9 @@ if $USE_PVE_ASSISTANT && ! $INTERACTIVE; then
   proxmox-auto-install-assistant prepare-iso "$PVE_ISO" \
     --fetch-from iso \
     --answer-file "$SCRIPT_DIR/answer.toml" \
+    --on-first-boot "$SCRIPT_DIR/first-boot.sh" \
     --output "$OUTPUT_ISO"
-  echo "  ✓ Automatische ISO erstellt (answer.toml + auto-install-assistant)"
-  echo "  ℹ  First-boot Scripts müssen nach Installation manuell deployt werden."
-  echo "     Oder: manueller ISO-Bau (ohne proxmox-auto-install-assistant) für vollständige Automatisierung."
+  echo "  ✓ Automatische ISO erstellt (answer.toml + first-boot.sh eingebettet)"
 
 # ── Modus B: Manueller ISO-Bau mit squashfs-Modifikation ─────────────────
 # Wird verwendet wenn: proxmox-auto-install-assistant nicht verfügbar ODER --interactive
