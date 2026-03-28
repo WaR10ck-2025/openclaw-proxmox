@@ -38,7 +38,124 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-# ── Schritt 1b: NAT/Masquerade für LXC-Netzwerk aktivieren ──────────────────
+# ── Schritt 1b: BOOT-MENÜ (Restore vs. Fresh-Install) ───────────────────────
+#
+# Sucht nach Backup-Daten in zwei Stufen:
+#   1. Dedizierte Partition (Label=OPENCLAW-BAK) — Standard + Ventoy Modus C
+#   2. Ventoy-Partition (Label=Ventoy) mit openclaw-backups/ Unterordner — Ventoy Modus B
+#
+# Zeigt Menü mit Backup-Info + 30s Countdown.
+# Headless (stdin=/dev/null): read schlägt sofort fehl → Standard greift.
+
+BACKUP_USB_MOUNT="/mnt/backup-usb"
+
+# ── USB-Backup-Quelle suchen (2-stufig) ─────────────────────────────────────
+find_backup_source() {
+  mkdir -p "$BACKUP_USB_MOUNT"
+
+  # Stufe 1: Dedizierte OPENCLAW-BAK Partition
+  local dev
+  dev=$(blkid -L "OPENCLAW-BAK" 2>/dev/null || true)
+  if [ -n "$dev" ]; then
+    mountpoint -q "$BACKUP_USB_MOUNT" || mount "$dev" "$BACKUP_USB_MOUNT" 2>/dev/null || true
+    if [ -d "${BACKUP_USB_MOUNT}/openclaw-backups" ]; then
+      echo "$dev"
+      return 0
+    fi
+    umount "$BACKUP_USB_MOUNT" 2>/dev/null || true
+  fi
+
+  # Stufe 2: Ventoy-Partition mit openclaw-backups/ Ordner
+  dev=$(blkid -L "Ventoy" 2>/dev/null || true)
+  if [ -n "$dev" ]; then
+    mountpoint -q "$BACKUP_USB_MOUNT" || mount "$dev" "$BACKUP_USB_MOUNT" 2>/dev/null || true
+    if [ -d "${BACKUP_USB_MOUNT}/openclaw-backups/dump" ]; then
+      echo "$dev"
+      return 0
+    fi
+    umount "$BACKUP_USB_MOUNT" 2>/dev/null || true
+  fi
+
+  return 1
+}
+
+# ── Menü anzeigen + Modus bestimmen ──────────────────────────────────────────
+show_boot_menu() {
+  local backup_dev backup_found=false
+  local lxc_count=0 vm_count=0 cfg_count=0 free_gb="?"
+
+  backup_dev=$(find_backup_source 2>/dev/null || true)
+  if [ -n "$backup_dev" ] && mountpoint -q "$BACKUP_USB_MOUNT"; then
+    lxc_count=$(ls "${BACKUP_USB_MOUNT}/openclaw-backups/dump/"*.tar.zst 2>/dev/null | wc -l || echo 0)
+    vm_count=$(ls "${BACKUP_USB_MOUNT}/openclaw-backups/dump/"*.vma.zst 2>/dev/null | wc -l || echo 0)
+    cfg_count=$(find "${BACKUP_USB_MOUNT}/openclaw-backups/configs/" -name "*.age" 2>/dev/null | wc -l || echo 0)
+    free_gb=$(df -BG "$BACKUP_USB_MOUNT" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G' || echo "?")
+    [ "$((lxc_count + vm_count + cfg_count))" -gt 0 ] && backup_found=true
+  fi
+
+  log ""
+  log "╔══════════════════════════════════════════════════════════════╗"
+  log "║           OpenClaw Proxmox — Willkommen                     ║"
+  log "╠══════════════════════════════════════════════════════════════╣"
+  log "║  [1]  Fresh-Install      Neue Installation                  ║"
+  if [ "$backup_found" = "true" ]; then
+    log "║  [2]  Disaster Recovery  Backup von USB wiederherstellen    ║"
+    log "╠══════════════════════════════════════════════════════════════╣"
+    log "║  Backup erkannt:  ${lxc_count} LXCs  ${vm_count} VMs  ${cfg_count} Configs  |  Frei: ${free_gb}GB  ║"
+    log "╚══════════════════════════════════════════════════════════════╝"
+    local default_mode=2
+    log ""
+    log "  Auswahl [1/2] (Standard: ${default_mode} — Disaster Recovery — in 30s):"
+  else
+    log "║  [2]  Disaster Recovery  (kein Backup erkannt — inaktiv)    ║"
+    log "╚══════════════════════════════════════════════════════════════╝"
+    local default_mode=1
+    log ""
+    log "  Auswahl [1] (Standard: Fresh-Install — in 30s):"
+  fi
+
+  # Eingabe mit Timeout — bei headless (stdin=/dev/null) sofortiger EOF → Standard
+  local choice=""
+  read -t 30 -r choice 2>/dev/null || true
+  choice="${choice:-$default_mode}"
+
+  case "$choice" in
+    2)
+      if [ "$backup_found" = "true" ]; then
+        echo "restore"
+      else
+        log "  Kein Backup verfügbar — starte Fresh-Install"
+        echo "fresh"
+      fi
+      ;;
+    *) echo "fresh" ;;
+  esac
+}
+
+log_section "Modus-Auswahl"
+SELECTED_MODE=$(show_boot_menu)
+log "  → Modus: $SELECTED_MODE"
+
+# ── Modus-Weiche ─────────────────────────────────────────────────────────────
+if [ "$SELECTED_MODE" = "restore" ]; then
+  log_section "DISASTER RECOVERY: Vollständige Wiederherstellung"
+  HOOK_SCRIPT="/root/openclaw-restore-hook.sh"
+  [ ! -f "$HOOK_SCRIPT" ] && HOOK_SCRIPT="${REPO_DIR}/autoinstall/restore-hook.sh"
+  if [ -f "$HOOK_SCRIPT" ]; then
+    bash "$HOOK_SCRIPT"
+  else
+    log "✗ restore-hook.sh nicht gefunden — Restore abgebrochen"
+    log "  Gesucht: /root/openclaw-restore-hook.sh"
+    exit 1
+  fi
+  touch "$DONE_FLAG"
+  log "✓ Disaster Recovery abgeschlossen. Flag: $DONE_FLAG"
+  exit 0
+fi
+
+# Ab hier: normaler Fresh-Install ────────────────────────────────────────────
+
+# ── Schritt 1c: NAT/Masquerade für LXC-Netzwerk aktivieren ──────────────────
 # Stellt sicher dass LXCs Internet-Zugang haben, auch wenn der upstream Router
 # das 192.168.10.x Subnetz nicht kennt (z.B. VirtualBox NAT, einfache Router).
 log "Aktiviere IP-Masquerade für LXC-Netzwerk..."

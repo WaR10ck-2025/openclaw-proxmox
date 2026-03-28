@@ -30,6 +30,9 @@ ConditionPathExists=!/etc/openclaw-setup.done
 [Service]
 Type=oneshot
 ExecStart=/root/openclaw-first-boot.sh
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
 StandardOutput=journal+console
 StandardError=journal+console
 SyslogIdentifier=openclaw-first-boot
